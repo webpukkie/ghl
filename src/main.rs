@@ -972,35 +972,42 @@ fn kbd_bright_get() -> Option<u8> {
 fn kbd_bright_set(level: u8) -> Result<String, String> {
     let lvl = level.min(3);
     let mut errors = Vec::new();
+    let mut via_sysfs = false;
+    let mut via_hid = false;
 
-    // Try the LED class first, but never let a failed sysfs write prevent
-    // the ASUS HID report fallback from being attempted.
+    // LED class writes can succeed without the EC actually lighting the
+    // keyboard on some models, so the ASUS HID report is always sent too.
     if let Some(dir) = kbd_led_dir() {
         let p = dir.join("brightness");
         if p.exists() {
             match wr(&p, lvl.to_string()) {
-                Ok(()) => {
-                    return Ok(format!(
-                        "kbd brightness: {} ({lvl}/3) via sysfs",
-                        KBD_BRIGHT_LABELS[lvl as usize]
-                    ));
-                }
+                Ok(()) => via_sysfs = true,
                 Err(e) => errors.push(e),
             }
         }
     }
 
-    if asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]) {
-        return Ok(format!(
-            "kbd brightness: {} ({lvl}/3) via ASUS HID",
-            KBD_BRIGHT_LABELS[lvl as usize]
-        ));
-    }
+    via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
 
-    if errors.is_empty() {
-        Err("keyboard backlight interface not found (LED sysfs and ASUS HID unavailable)".into())
+    if !via_sysfs && !via_hid {
+        if errors.is_empty() {
+            Err("keyboard backlight interface not found (LED sysfs and ASUS HID unavailable)".into())
+        } else {
+            Err(format!("keyboard backlight failed: {}", errors.join("; ")))
+        }
     } else {
-        Err(format!("keyboard backlight failed: {}", errors.join("; ")))
+        let mut method = Vec::new();
+        if via_sysfs {
+            method.push("sysfs");
+        }
+        if via_hid {
+            method.push("HID");
+        }
+        Ok(format!(
+            "kbd brightness: {} ({lvl}/3) via {}",
+            KBD_BRIGHT_LABELS[lvl as usize],
+            method.join("+")
+        ))
     }
 }
 
@@ -1094,19 +1101,29 @@ fn kbd_color_set(c: Rgb) -> Result<String, String> {
         }
     }
 
-    if !applied {
+    // Apply the HID color report even when a sysfs path succeeded: on many
+    // models the EC only honors this packet and ignores multi_intensity.
+    let mut hid = false;
+    {
         let msg = [
             0x5D, 0xB3, 0x00, 0x00, c.0, c.1, c.2, 0x00, 0x00, 0x00, c.0, c.1, c.2,
         ];
         if asus_hidraw_write(&msg) {
             let _ = asus_hidraw_write(&[0x5D, 0xB5, 0, 0, 0]);
             let _ = asus_hidraw_write(&[0x5D, 0xB4]);
-            applied = true;
+            hid = true;
         }
     }
 
-    if applied {
-        Ok(format!("kbd color: {}", c.label()))
+    if applied || hid {
+        let mut method = Vec::new();
+        if applied {
+            method.push("sysfs");
+        }
+        if hid {
+            method.push("HID");
+        }
+        Ok(format!("kbd color: {} via {}", c.label(), method.join("+")))
     } else {
         Err("keyboard RGB interface (multi_intensity / kbd_rgb_mode / hidraw) not found".into())
     }
