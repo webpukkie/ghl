@@ -986,7 +986,8 @@ fn kbd_bright_set(level: u8) -> Result<String, String> {
         }
     }
 
-    let via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
+    let via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl])
+        && asus_hidraw_write(&[0x5D, 0xB4]);
 
     if !via_sysfs && !via_hid {
         if errors.is_empty() {
@@ -2657,6 +2658,19 @@ fn status(cfg: &Cfg) {
     println!(
         "kbd-color  : {}",
         kbd_color_get(cfg).map_or_else(|| "default".into(), |c| c.label())
+    );
+    let hids = asus_hidraw_devs();
+    println!(
+        "asus-hidraw: {}",
+        if hids.is_empty() {
+            "none found".to_string()
+        } else {
+            hids
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
     );
     println!(
         "webcam     : {}",
