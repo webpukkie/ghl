@@ -876,16 +876,54 @@ fn cpu_boost_set(on: bool) -> Result<(), String> {
 }
 
 /// Default boost policy: Silent disables boost; Balanced and Turbo enable it.
-/// `cpu_boost=on|off` in ghl.conf is an explicit override; `cpuboost auto`
-/// clears that override and returns to this mode-dependent policy.
-fn cpu_boost_for_mode(mode: Mode) -> bool {
+fn cpu_boost_default_for_mode(mode: Mode) -> bool {
     !matches!(mode, Mode::Silent)
 }
 
+/// Resolve boost for one mode: per-mode override `cpu_boost.<mode>=on|off`
+/// wins, then the global `cpu_boost=on|off` override, else the default
+/// mode-dependent policy. Returns (enabled, overridden).
+fn cpu_boost_resolve_for_mode(mode: Mode, cfg: &Cfg) -> (bool, bool) {
+    if let Some(b) = cfg.cpu_boost_modes.get(&mode) {
+        (*b, true)
+    } else if let Some(b) = cfg.cpu_boost {
+        (b, true)
+    } else {
+        (cpu_boost_default_for_mode(mode), false)
+    }
+}
+
+fn cpu_boost_for_mode(mode: Mode, cfg: &Cfg) -> bool {
+    cpu_boost_resolve_for_mode(mode, cfg).0
+}
+
 fn cpu_boost_apply_for_mode(mode: Mode, cfg: &Cfg) -> Result<bool, String> {
-    let enabled = cfg.cpu_boost.unwrap_or_else(|| cpu_boost_for_mode(mode));
+    let enabled = cpu_boost_for_mode(mode, cfg);
     cpu_boost_set(enabled)?;
     Ok(enabled)
+}
+
+/// CLI: `ghl cpuboost <mode> on|off|auto`.
+fn cpu_boost_cli_set(cfg: &mut Cfg, m: Mode, v: &str) -> Result<(), String> {
+    let current = cfg.mode.or_else(mode_current);
+    if v == "auto" {
+        cfg.cpu_boost_modes.remove(&m);
+        if current == Some(m) {
+            let enabled = cpu_boost_apply_for_mode(m, cfg)?;
+            println!("cpu boost {} ({} mode policy)", on_off(enabled), m.name());
+        } else {
+            println!("cpu boost for {} mode set to automatic", m.name());
+        }
+    } else {
+        let on = parse_toggle(v).ok_or("cpuboost: [mode] on|off|auto")?;
+        cfg.cpu_boost_modes.insert(m, on);
+        if current == Some(m) {
+            cpu_boost_set(on)?;
+        }
+        println!("cpu boost {} for {} mode", on_off(on), m.name());
+    }
+    cfg.save()?;
+    Ok(())
 }
 
 // ───────────────────────── Panel Overdrive ─────────────────────────
@@ -2241,6 +2279,7 @@ struct Cfg {
     autobright: bool,
     nv_power_fix: bool,
     cpu_boost: Option<bool>,
+    cpu_boost_modes: BTreeMap<Mode, bool>,
     panel_od: Option<bool>,
     disable_igpu_dgpu: bool,
     disable_npu: bool,
@@ -2284,7 +2323,11 @@ impl Cfg {
                     }
                 }
                 _ => {
-                    if let Some(rk) = k.strip_prefix("ryzen.") {
+                    if let Some(rest) = k.strip_prefix("cpu_boost.") {
+                        if let (Some(m), Some(b)) = (Mode::parse(rest), parse_toggle(v)) {
+                            c.cpu_boost_modes.insert(m, b);
+                        }
+                    } else if let Some(rk) = k.strip_prefix("ryzen.") {
                         let _ = c.ryzen.set_by_key(rk, v);
                     } else if let Some(rest) = k.strip_prefix("fan.") {
                         if let Some((m_str, n_str)) = rest.split_once('.') {
@@ -2325,6 +2368,9 @@ impl Cfg {
         let _ = writeln!(s, "disable_npu={}", u8::from(self.disable_npu));
         if let Some(b) = self.cpu_boost {
             let _ = writeln!(s, "cpu_boost={}", u8::from(b));
+        }
+        for (m, b) in &self.cpu_boost_modes {
+            let _ = writeln!(s, "cpu_boost.{}={}", m.name(), u8::from(*b));
         }
         if let Some(od) = self.panel_od {
             let _ = writeln!(s, "panel_od={}", u8::from(od));
@@ -2444,12 +2490,18 @@ fn apply(cfg: &mut Cfg) -> Vec<String> {
         Err(e) => out.push(format!("error: {e}")),
     };
     note(ab_set(cfg.autobright).map(|_| format!("auto-brightness {}", on_off(cfg.autobright))));
-    if let Some(b) = cfg.cpu_boost {
-        note(cpu_boost_set(b).map(|_| format!("cpu boost override {}", on_off(b))));
-    } else if let Some(m) = cfg.mode.or_else(mode_current) {
-        note(cpu_boost_apply_for_mode(m, cfg).map(|b| {
-            format!("cpu boost {} ({} mode policy)", on_off(b), m.name())
+    if let Some(m) = cfg.mode.or_else(mode_current) {
+        let (b, overridden) = cpu_boost_resolve_for_mode(m, cfg);
+        note(cpu_boost_set(b).map(|_| {
+            format!(
+                "cpu boost {} ({} mode {})",
+                on_off(b),
+                m.name(),
+                if overridden { "override" } else { "policy" }
+            )
         }));
+    } else if let Some(b) = cfg.cpu_boost {
+        note(cpu_boost_set(b).map(|_| format!("cpu boost override {}", on_off(b))));
     }
     if let Some(od) = cfg.panel_od {
         note(panel_od_set(od));
@@ -2574,6 +2626,11 @@ fn status(cfg: &Cfg) {
         "cpu-boost  : {}",
         cpu_boost_get().map_or("unsupported", on_off)
     );
+    for m in MODES {
+        if let Some(b) = cfg.cpu_boost_modes.get(&m) {
+            println!("             {} mode override: {}", m.name(), on_off(*b));
+        }
+    }
     println!(
         "kbd-bright : {}",
         kbd_bright_get().map_or_else(
@@ -2670,7 +2727,7 @@ fn usage() {
          ghl touchpad on|off\n\
          ghl autobright on|off\n\
          ghl nvfix on|off|apply\n\
-         ghl cpuboost on|off\n\
+         ghl cpuboost [silent|balanced|turbo] on|off|auto   (per-mode boost, no mode = current)\n\
          ghl apply                                            (restore saved config at boot)\n\
          ghl gamemode status|list|running\n\
          ghl gamemode daemon                                  (run auto-perf loop, use with systemd)\n\
@@ -2881,8 +2938,13 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             ab_set(on)?;
             cfg.save()?;
         }
+        ["cpuboost", m_str, v] if Mode::parse(m_str).is_some() => {
+            let m = Mode::parse(m_str).ok_or("cpuboost: [mode] on|off|auto")?;
+            cpu_boost_cli_set(cfg, m, v)?;
+        }
         ["cpuboost", "auto"] => {
             cfg.cpu_boost = None;
+            cfg.cpu_boost_modes.clear();
             if let Some(m) = cfg.mode.or_else(mode_current) {
                 let enabled = cpu_boost_apply_for_mode(m, &cfg)?;
                 println!("cpu boost {} ({} mode policy)", on_off(enabled), m.name());
@@ -2892,11 +2954,20 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             cfg.save()?;
         }
         ["cpuboost", v] => {
-            let on = parse_toggle(v).ok_or("cpuboost: on|off|auto")?;
-            cfg.cpu_boost = Some(on);
-            cpu_boost_set(on)?;
+            let on = parse_toggle(v).ok_or("cpuboost: [mode] on|off|auto")?;
+            match cfg.mode.or_else(mode_current) {
+                Some(m) => {
+                    cfg.cpu_boost_modes.insert(m, on);
+                    cpu_boost_set(on)?;
+                    println!("cpu boost {} for {} mode", on_off(on), m.name());
+                }
+                None => {
+                    cfg.cpu_boost = Some(on);
+                    cpu_boost_set(on)?;
+                    println!("cpu boost override {}", on_off(on));
+                }
+            }
             cfg.save()?;
-            println!("cpu boost override {}", on_off(on));
         }
         ["nvfix" | "nv-fix", "apply"] => {
             println!("{}", nv_fix_apply()?);
@@ -3464,7 +3535,24 @@ impl App {
                 let fan_name = self.fans.get(self.fan_i).map_or("unsupported", |f| f.1);
                 line(out, &mut y, format!(" Performance mode: {}   (←→ change mode)", modes.join(" ")), self.pt == 0)?;
                 let boost = cpu_boost_get().map_or("unsupported", on_off_upper);
-                let policy = if self.cfg.cpu_boost.is_some() { "manual override" } else { "automatic by mode" };
+                let policy = if self.cfg.cpu_boost_modes.is_empty() && self.cfg.cpu_boost.is_none() {
+                    "automatic by mode".to_string()
+                } else {
+                    MODES
+                        .iter()
+                        .map(|mode| {
+                            let b = self
+                                .cfg
+                                .cpu_boost_modes
+                                .get(mode)
+                                .copied()
+                                .or(self.cfg.cpu_boost)
+                                .unwrap_or_else(|| cpu_boost_default_for_mode(*mode));
+                            format!("{}:{}", mode.name(), on_off(b))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
                 line(out, &mut y, format!(" CPU boost: {boost} ({policy})   [b] toggle / [a] auto"), self.pt == 1)?;
                 line(out, &mut y, format!(" Fan curve: {fan_name}"), false)?;
                 for (i, (t, p)) in self.curve.iter().enumerate() {
@@ -3790,10 +3878,11 @@ impl App {
                             self.report(r);
                             self.load_curve();
                         } else if self.pt == 1 {
+                            let m = self.mode_cur.unwrap_or(Mode::Balanced);
                             let next = dir > 0;
-                            self.cfg.cpu_boost = Some(next);
+                            self.cfg.cpu_boost_modes.insert(m, next);
                             let r = cpu_boost_set(next).and_then(|_| self.cfg.save())
-                                .map(|_| format!("CPU boost {} (manual override)", on_off(next)));
+                                .map(|_| format!("CPU boost {} ({} mode)", on_off(next), m.name()));
                             self.report(r);
                         } else {
                             let i = self.pt - 2;
@@ -3801,14 +3890,16 @@ impl App {
                         }
                     }
                     KeyCode::Char('b') | KeyCode::Char(' ') | KeyCode::Enter if self.pt == 1 => {
+                        let m = self.mode_cur.unwrap_or(Mode::Balanced);
                         let next = !cpu_boost_get().unwrap_or(true);
-                        self.cfg.cpu_boost = Some(next);
-                        let r = cpu_boost_set(next).and_then(|_| self.cfg.save()).map(|_| format!("CPU boost {} (manual override)", on_off(next)));
+                        self.cfg.cpu_boost_modes.insert(m, next);
+                        let r = cpu_boost_set(next).and_then(|_| self.cfg.save()).map(|_| format!("CPU boost {} ({} mode)", on_off(next), m.name()));
                         self.report(r);
                     }
                     KeyCode::Char('a') => {
-                        self.cfg.cpu_boost = None;
                         let m = self.mode_cur.unwrap_or(Mode::Balanced);
+                        self.cfg.cpu_boost_modes.remove(&m);
+                        self.cfg.cpu_boost = None;
                         let r = cpu_boost_apply_for_mode(m, &self.cfg)
                             .and_then(|enabled| self.cfg.save().map(|_| format!("CPU boost {} (automatic mode policy)", on_off(enabled))));
                         self.report(r);
