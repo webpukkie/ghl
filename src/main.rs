@@ -170,19 +170,11 @@ const AURA_PIDS: &[u16] = &[
 ];
 
 #[repr(C)]
-struct HidrawDevInfo {
-    bustype: u32,
-    vendor: i16,
-    product: i16,
-}
-
-#[repr(C)]
 struct HidrawReportDescriptor {
     size: u32,
     value: [u8; 4096],
 }
 
-const HIDIOCGRAWINFO: u64 = 0x80084803;
 const HIDIOCGRDESCSIZE: u64 = 0x80044801;
 const HIDIOCGRDESC: u64 = 0x90044802;
 const BUS_I2C_HID: u16 = 0x18;
@@ -197,30 +189,23 @@ extern "C" {
     fn raw_write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
 }
 
-fn hid_probe(path: &Path) -> Option<(u16, u16, u16)> {
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .or_else(|_| OpenOptions::new().read(true).open(path))
-        .ok()?;
-    let fd = f.as_raw_fd();
-    let mut info = HidrawDevInfo {
-        bustype: 0,
-        vendor: 0,
-        product: 0,
-    };
-    unsafe {
-        if ioctl(fd, HIDIOCGRAWINFO, &mut info as *mut HidrawDevInfo) < 0 {
-            return None;
-        }
+fn hid_uevent_ids(node: &str) -> Option<(u16, u16, u16)> {
+    let uev = rd(
+        PathBuf::from("/sys/class/hidraw")
+            .join(node)
+            .join("device/uevent"),
+    )?;
+    for line in uev.lines() {
+        let Some(v) = line.strip_prefix("HID_ID=") else {
+            continue;
+        };
+        let mut it = v.split(':');
+        let bus = u16::from_str_radix(it.next()?.trim(), 16).ok()?;
+        let vendor = u16::from_str_radix(it.next()?.trim(), 16).ok()?;
+        let product = u16::from_str_radix(it.next()?.trim(), 16).ok()?;
+        return Some((bus, vendor, product));
     }
-
-    Some((
-        info.bustype as u16,
-        info.vendor as u16,
-        info.product as u16,
-    ))
+    None
 }
 
 fn hid_desc_has_aura(fd: i32, bus: u16, pid: u16) -> bool {
@@ -252,6 +237,7 @@ use std::os::unix::io::AsRawFd;
 
 struct AuraDev {
     path: PathBuf,
+    product: u16,
     aura: bool,
 }
 
@@ -282,11 +268,12 @@ fn aura_devs() -> &'static [AuraDev] {
     DEVS.get_or_init(|| {
         let mut probes = Vec::new();
         for i in 0..32 {
-            let path = PathBuf::from(format!("/dev/hidraw{i}"));
-            if !path.exists() {
+            let node = format!("hidraw{i}");
+            let sys = PathBuf::from("/sys/class/hidraw").join(&node);
+            if !sys.exists() {
                 continue;
             }
-            let Some((bus, vendor, product)) = hid_probe(&path) else {
+            let Some((bus, vendor, product)) = hid_uevent_ids(&node) else {
                 continue;
             };
             if vendor != ASUS_VENDOR_ID {
@@ -295,9 +282,15 @@ fn aura_devs() -> &'static [AuraDev] {
             let aura = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&path)
-                .is_ok_and(|f| hid_desc_has_aura(f.as_raw_fd(), bus, product));
-            probes.push((hid_usb_parent(&path), AuraDev { path, aura }));
+                .open(format!("/dev/{node}"))
+                .map(|f| hid_desc_has_aura(f.as_raw_fd(), bus, product))
+                .unwrap_or_else(|_| {
+                    bus == BUS_I2C_HID && AURA_PIDS.contains(&product)
+                });
+            probes.push((
+                hid_usb_parent(&PathBuf::from(format!("/dev/{node}"))),
+                AuraDev { path: PathBuf::from(format!("/dev/{node}")), product, aura },
+            ));
         }
         let mut out: Vec<AuraDev> = Vec::new();
         for (parent, dev) in probes {
@@ -323,11 +316,7 @@ fn asus_hidraw_devs() -> Vec<String> {
     aura_devs()
         .iter()
         .map(|d| {
-            if d.aura {
-                format!("{}(aura)", d.path.display())
-            } else {
-                d.path.display().to_string()
-            }
+            format!("{}(0x{:04x}{})", d.path.display(), d.product, if d.aura { ",aura" } else { "" })
         })
         .collect()
 }
@@ -1183,6 +1172,22 @@ fn kbd_bright_set(level: u8) -> Result<String, String> {
                 Ok(()) => via_sysfs = true,
                 Err(e) => errors.push(e),
             }
+        }
+        // On TUF models the EC keeps the keyboard dark unless the "awake"
+        // lighting state is enabled, even with brightness > 0.
+        let state = dir.join("kbd_rgb_state");
+        if state.exists() {
+            let cur: Option<String> = rd(&state);
+            let mut toks: Vec<String> = cur
+                .as_deref()
+                .unwrap_or("1 1 0 0 0")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            toks.resize(5, "0".into());
+            toks[0] = "1".into();
+            toks[2] = "1".into();
+            let _ = wr(&state, toks.join(" "));
         }
     }
 
@@ -2847,13 +2852,28 @@ fn status(cfg: &Cfg) {
             println!("             {} mode override: {}", m.name(), on_off(*b));
         }
     }
-    println!(
-        "kbd-bright : {}",
-        kbd_bright_get().map_or_else(
-            || "unsupported".into(),
-            |lvl| format!("{} ({lvl}/3)", KBD_BRIGHT_LABELS[lvl as usize])
-        )
-    );
+    match kbd_led_dir() {
+        Some(dir) => {
+            println!(
+                "kbd-bright : {} (led: {}, max: {})",
+                kbd_bright_get().map_or_else(
+                    || "unknown".into(),
+                    |lvl| format!("{} ({lvl}/3)", KBD_BRIGHT_LABELS[lvl as usize])
+                ),
+                dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().to_string()),
+                rd(dir.join("max_brightness")).unwrap_or_else(|| "?".into()).trim()
+            );
+            for f in ["kbd_rgb_mode", "kbd_rgb_state", "multi_intensity"] {
+                if dir.join(f).exists() {
+                    println!(
+                        "             {f}: {}",
+                        rd(dir.join(f)).unwrap_or_else(|| "?".into()).trim()
+                    );
+                }
+            }
+        }
+        None => println!("kbd-bright : unsupported (no kbd_backlight LED found)"),
+    }
     println!(
         "kbd-color  : {}",
         kbd_color_get(cfg).map_or_else(|| "default".into(), |c| c.label())
