@@ -1978,6 +1978,14 @@ fn running_game_candidates() -> Vec<String> {
     out
 }
 
+fn gamemode_daemon_alive() -> bool {
+    fs::read_to_string("/run/ghl-gamemode.pid")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        .unwrap_or(false)
+}
+
 fn run_gamemode_daemon() {
     let restore_path = "/run/ghl-gamemode.state";
     let pid_path = "/run/ghl-gamemode.pid";
@@ -3158,6 +3166,13 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             for l in apply(cfg) {
                 println!("{l}");
             }
+            if cfg.game_rules.iter().any(|r| r.enabled) && !gamemode_daemon_alive() {
+                eprintln!(
+                    "note: game rules are enabled but the gamemode daemon is not running -\n\
+                     games will NOT switch performance modes automatically\n\
+                     install/start it once: sudo ghl gamemode service"
+                );
+            }
         }
         ["ryzen" | "ryzenadj", ref rest @ ..] => run_ryzen_cli(rest, cfg)?,
         ["gpu", g] => {
@@ -3311,9 +3326,45 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
                     } else {
                         println!("active           : no");
                     }
-                    let pid_path = "/run/ghl-gamemode.pid";
-                    if let Ok(p) = fs::read_to_string(pid_path) {
-                        println!("daemon pid       : {}", p.trim());
+                    if gamemode_daemon_alive() {
+                        println!("daemon           : running");
+                    } else {
+                        let unit = Path::new("/etc/systemd/system/ghl-gamemode.service").exists();
+                        println!("daemon           : NOT running - game rules will not auto-apply");
+                        if unit {
+                            println!("                   fix: sudo systemctl start ghl-gamemode");
+                        } else {
+                            println!("                   fix: sudo ghl gamemode service");
+                        }
+                    }
+                    if enabled_count > 0 {
+                        let rules: Vec<GameRule> = cfg
+                            .game_rules
+                            .iter()
+                            .filter(|r| r.enabled)
+                            .cloned()
+                            .collect();
+                        let matched = scan_procs(&rules);
+                        println!(
+                            "current detection: {}",
+                            if matched {
+                                "MATCH - enabled rules see a running game"
+                            } else {
+                                "no running game matches enabled rules"
+                            }
+                        );
+                        if !matched {
+                            let running = running_game_candidates();
+                            if !running.is_empty() {
+                                println!(
+                                    "                   running candidates: {}",
+                                    running.join(", ")
+                                );
+                            }
+                        }
+                    }
+                    if let Some(m) = mode_current() {
+                        println!("current mode     : {}", m.name());
                     }
                 }
                 ["daemon"] => {
