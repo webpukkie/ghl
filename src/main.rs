@@ -973,7 +973,6 @@ fn kbd_bright_set(level: u8) -> Result<String, String> {
     let lvl = level.min(3);
     let mut errors = Vec::new();
     let mut via_sysfs = false;
-    let mut via_hid = false;
 
     // LED class writes can succeed without the EC actually lighting the
     // keyboard on some models, so the ASUS HID report is always sent too.
@@ -987,7 +986,7 @@ fn kbd_bright_set(level: u8) -> Result<String, String> {
         }
     }
 
-    via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
+    let via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
 
     if !via_sysfs && !via_hid {
         if errors.is_empty() {
