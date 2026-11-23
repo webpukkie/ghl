@@ -158,31 +158,231 @@ fn kbd_led_dir() -> Option<PathBuf> {
     None
 }
 
-fn asus_hidraw_devs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/hidraw") else {
-        return out;
+// ASUS AURA keyboard control via hidraw. The EC firmware only honors these
+// packets as feature reports (ioctl HIDIOCSFEATURE, 64-byte padded), and only
+// after the 0xB9 + "ASUS Tech.Inc." handshake; plain hidraw writes are
+// accepted by the kernel but silently ignored by the device.
+const ASUS_VENDOR_ID: u16 = 0x0B05;
+const AURA_PIDS: &[u16] = &[
+    0x1A30, 0x1854, 0x1869, 0x1866, 0x19B6, 0x1822, 0x1837, 0x184A, 0x183D,
+    0x8502, 0x1807, 0x17E0, 0x1ABE, 0x1B4C, 0x1B6E, 0x1B2C, 0x8854, 0x1CE7,
+    0x1CE6, 0x1BF2, 0x1BF3, 0x1CD7, 0x1CD8,
+];
+
+#[repr(C)]
+struct HidrawDevInfo {
+    bustype: u32,
+    vendor: i16,
+    product: i16,
+}
+
+#[repr(C)]
+struct HidrawReportDescriptor {
+    size: u32,
+    value: [u8; 4096],
+}
+
+const HIDIOCGRAWINFO: u64 = 0x80084803;
+const HIDIOCGRDESCSIZE: u64 = 0x80044801;
+const HIDIOCGRDESC: u64 = 0x90044802;
+const BUS_I2C_HID: u16 = 0x18;
+
+const fn hid_iocsfeature(len: usize) -> u64 {
+    0xC0004806u64 | ((len as u64 & 0x3FFF) << 16)
+}
+
+extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    #[link_name = "write"]
+    fn raw_write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
+}
+
+fn hid_probe(path: &Path) -> Option<(u16, u16, u16)> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|_| OpenOptions::new().read(true).open(path))
+        .ok()?;
+    let fd = f.as_raw_fd();
+    let mut info = HidrawDevInfo {
+        bustype: 0,
+        vendor: 0,
+        product: 0,
     };
-    for e in entries.flatten() {
-        let uevent = e.path().join("device/uevent");
-        if rd(&uevent).is_some_and(|u| u.to_ascii_uppercase().contains("0B05:")) {
-            out.push(PathBuf::from("/dev").join(e.file_name()));
+    unsafe {
+        if ioctl(fd, HIDIOCGRAWINFO, &mut info as *mut HidrawDevInfo) < 0 {
+            return None;
         }
     }
-    out
+
+    Some((
+        info.bustype as u16,
+        info.vendor as u16,
+        info.product as u16,
+    ))
+}
+
+fn hid_desc_has_aura(fd: i32, bus: u16, pid: u16) -> bool {
+    let mut size: i32 = 0;
+    let ok = unsafe {
+        if ioctl(fd, HIDIOCGRDESCSIZE, &mut size as *mut i32) >= 0
+            && size > 0
+            && size <= 4096
+        {
+            let mut desc = HidrawReportDescriptor {
+                size: size as u32,
+                value: [0u8; 4096],
+            };
+            if ioctl(fd, HIDIOCGRDESC, &mut desc as *mut HidrawReportDescriptor) >= 0 {
+                desc.value[..size as usize]
+                    .windows(2)
+                    .any(|w| w == [0x85, 0x5D])
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    ok || (bus == BUS_I2C_HID && AURA_PIDS.contains(&pid))
+}
+
+use std::os::unix::io::AsRawFd;
+
+struct AuraDev {
+    path: PathBuf,
+    aura: bool,
+}
+
+fn hid_usb_parent(dev: &Path) -> Option<PathBuf> {
+    let name = dev.file_name()?.to_string_lossy().to_string();
+    let sys = PathBuf::from("/sys/class/hidraw").join(&name);
+    let mut cur = fs::canonicalize(&sys).ok()?;
+    for _ in 0..16 {
+        if !cur.starts_with("/sys/device") {
+            break;
+        }
+        let uev = rd(cur.join("uevent"))?
+            .to_ascii_uppercase();
+        if uev.contains("DEVTYPE=USB_DEVICE") {
+            let vend = rd(cur.join("idVendor")).unwrap_or_default();
+            if vend.trim() == "0b05" {
+                return Some(cur);
+            }
+            return None;
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+    None
+}
+
+fn aura_devs() -> &'static [AuraDev] {
+    static DEVS: OnceLock<Vec<AuraDev>> = OnceLock::new();
+    DEVS.get_or_init(|| {
+        let mut probes = Vec::new();
+        for i in 0..32 {
+            let path = PathBuf::from(format!("/dev/hidraw{i}"));
+            if !path.exists() {
+                continue;
+            }
+            let Some((bus, vendor, product)) = hid_probe(&path) else {
+                continue;
+            };
+            if vendor != ASUS_VENDOR_ID {
+                continue;
+            }
+            let aura = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .is_ok_and(|f| hid_desc_has_aura(f.as_raw_fd(), bus, product));
+            probes.push((hid_usb_parent(&path), AuraDev { path, aura }));
+        }
+        let mut out: Vec<AuraDev> = Vec::new();
+        for (parent, dev) in probes {
+            if let Some(p) = &parent {
+                if let Some(pos) = out.iter().position(|d| {
+                    hid_usb_parent(&d.path).as_ref() == Some(p)
+                }) {
+                    if dev.aura && !out[pos].aura {
+                        out[pos] = dev;
+                    }
+                    continue;
+                }
+            }
+            out.push(dev);
+        }
+        // Prefer known AURA keyboards in front so handshake targets them first.
+        out.sort_by_key(|d| !d.aura);
+        out
+    })
+}
+
+fn asus_hidraw_devs() -> Vec<String> {
+    aura_devs()
+        .iter()
+        .map(|d| {
+            if d.aura {
+                format!("{}(aura)", d.path.display())
+            } else {
+                d.path.display().to_string()
+            }
+        })
+        .collect()
+}
+
+fn asus_aura_init_done() -> &'static bool {
+    static DONE: OnceLock<bool> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let a = aura_pkt_raw(&[0x5D, 0xB9]);
+        let mut greet = Vec::with_capacity(1 + 14);
+        greet.push(0x5D);
+        greet.extend_from_slice(b"ASUS Tech.Inc.");
+        let b = aura_pkt_raw(&greet);
+        a || b
+    })
 }
 
 fn asus_hidraw_write(pkt: &[u8]) -> bool {
-    let mut buf = [0u8; 64];
-    let len = pkt.len().min(64);
-    buf[..len].copy_from_slice(&pkt[..len]);
+    asus_aura_init_done();
+    aura_pkt_raw(pkt)
+}
 
+fn aura_pkt_raw(pkt: &[u8]) -> bool {
+    let devs = aura_devs();
+    let mut targets: Vec<&AuraDev> = devs.iter().filter(|d| d.aura).collect();
+    if targets.is_empty() {
+        targets = devs.iter().collect();
+    }
     let mut wrote = false;
-    for dev in asus_hidraw_devs() {
-        if let Ok(mut f) = OpenOptions::new().write(true).open(&dev) {
-            if f.write_all(&buf).is_ok() {
-                wrote = true;
-            }
+    for dev in targets {
+        let Ok(f) = OpenOptions::new().read(true).write(true).open(&dev.path) else {
+            continue;
+        };
+        let fd = f.as_raw_fd();
+        let mut buf = [0u8; 64];
+        buf[..pkt.len().min(64)].copy_from_slice(&pkt[..pkt.len().min(64)]);
+        let set = unsafe {
+            ioctl(
+                fd,
+                hid_iocsfeature(buf.len()),
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+            )
+        };
+        if set >= 0 {
+            wrote = true;
+            continue;
+        }
+        let raw = unsafe {
+            raw_write(
+                fd,
+                buf.as_ptr() as *const core::ffi::c_void,
+                buf.len(),
+            )
+        };
+        if raw >= 0 {
+            wrote = true;
         }
     }
     wrote
@@ -986,8 +1186,7 @@ fn kbd_bright_set(level: u8) -> Result<String, String> {
         }
     }
 
-    let via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl])
-        && asus_hidraw_write(&[0x5D, 0xB4]);
+    let via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
 
     if !via_sysfs && !via_hid {
         if errors.is_empty() {
@@ -2667,7 +2866,7 @@ fn status(cfg: &Cfg) {
         } else {
             hids
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(" ")
         }
