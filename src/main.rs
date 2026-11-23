@@ -163,6 +163,7 @@ fn kbd_led_dir() -> Option<PathBuf> {
 // after the 0xB9 + "ASUS Tech.Inc." handshake; plain hidraw writes are
 // accepted by the kernel but silently ignored by the device.
 const ASUS_VENDOR_ID: u16 = 0x0B05;
+const KBD_I2C_PID: u16 = 0x19B6;
 const AURA_PIDS: &[u16] = &[
     0x1A30, 0x1854, 0x1869, 0x1866, 0x19B6, 0x1822, 0x1837, 0x184A, 0x183D,
     0x8502, 0x1807, 0x17E0, 0x1ABE, 0x1B4C, 0x1B6E, 0x1B2C, 0x8854, 0x1CE7,
@@ -238,6 +239,7 @@ use std::os::unix::io::AsRawFd;
 struct AuraDev {
     path: PathBuf,
     product: u16,
+    i2c: bool,
     aura: bool,
 }
 
@@ -289,7 +291,12 @@ fn aura_devs() -> &'static [AuraDev] {
                 });
             probes.push((
                 hid_usb_parent(&PathBuf::from(format!("/dev/{node}"))),
-                AuraDev { path: PathBuf::from(format!("/dev/{node}")), product, aura },
+                AuraDev {
+                    path: PathBuf::from(format!("/dev/{node}")),
+                    product,
+                    i2c: bus == BUS_I2C_HID,
+                    aura,
+                },
             ));
         }
         let mut out: Vec<AuraDev> = Vec::new();
@@ -316,7 +323,15 @@ fn asus_hidraw_devs() -> Vec<String> {
     aura_devs()
         .iter()
         .map(|d| {
-            format!("{}(0x{:04x}{})", d.path.display(), d.product, if d.aura { ",aura" } else { "" })
+            format!(
+                "{}(0x{:04x},{},{},{}{})", 
+                d.path.display(),
+                d.product,
+                if d.aura { "aura" } else { "no-aura" },
+                if d.i2c { "i2c" } else { "usb" },
+                if d.aura && d.product == KBD_I2C_PID { "oobe-fix" } else { "-" },
+                if d.aura { "" } else { " [ignore]" }
+            )
         })
         .collect()
 }
@@ -324,18 +339,65 @@ fn asus_hidraw_devs() -> Vec<String> {
 fn asus_aura_init_done() -> &'static bool {
     static DONE: OnceLock<bool> = OnceLock::new();
     DONE.get_or_init(|| {
+        let mut ok = false;
+        // The FA608-series I2C-HID keyboard (0x19B6) ships in a factory
+        // "backlight OOBE" state that keeps the keyboard dark; disable it
+        // once with an exact-size (not 64-padded) feature report.
+        for d in aura_devs()
+            .iter()
+            .filter(|d| d.aura && d.product == KBD_I2C_PID && d.i2c)
+        {
+            ok |= aura_write_dev(d, &[0x46, 0x01], 2);
+        }
         let a = aura_pkt_raw(&[0x5D, 0xB9]);
         let mut greet = Vec::with_capacity(1 + 14);
         greet.push(0x5D);
         greet.extend_from_slice(b"ASUS Tech.Inc.");
         let b = aura_pkt_raw(&greet);
-        a || b
+        // Dynamic-lighting init: required on the I2C-HID + asus-armoury
+        // path (FA608 chassis) before the lights respond at all.
+        for d in aura_devs().iter().filter(|d| d.aura && d.product == KBD_I2C_PID) {
+            ok |= aura_write_dev(d, &[0x5D, 0xC0, 0x03, 0x01], 64);
+        }
+        ok || a || b
     })
 }
 
 fn asus_hidraw_write(pkt: &[u8]) -> bool {
     asus_aura_init_done();
     aura_pkt_raw(pkt)
+}
+
+fn aura_write_dev(dev: &AuraDev, pkt: &[u8], pad: usize) -> bool {
+    let Ok(f) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&dev.path)
+    else {
+        return false;
+    };
+    let fd = f.as_raw_fd();
+    let mut buf = [0u8; 64];
+    buf[..pkt.len().min(64)].copy_from_slice(&pkt[..pkt.len().min(64)]);
+    let size = pad.clamp(pkt.len(), 64);
+    let set = unsafe {
+        ioctl(
+            fd,
+            hid_iocsfeature(size),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+        )
+    };
+    if set >= 0 {
+        return true;
+    }
+    let raw = unsafe {
+        raw_write(
+            fd,
+            buf.as_ptr() as *const core::ffi::c_void,
+            buf.len(),
+        )
+    };
+    raw >= 0
 }
 
 fn aura_pkt_raw(pkt: &[u8]) -> bool {
@@ -346,31 +408,7 @@ fn aura_pkt_raw(pkt: &[u8]) -> bool {
     }
     let mut wrote = false;
     for dev in targets {
-        let Ok(f) = OpenOptions::new().read(true).write(true).open(&dev.path) else {
-            continue;
-        };
-        let fd = f.as_raw_fd();
-        let mut buf = [0u8; 64];
-        buf[..pkt.len().min(64)].copy_from_slice(&pkt[..pkt.len().min(64)]);
-        let set = unsafe {
-            ioctl(
-                fd,
-                hid_iocsfeature(buf.len()),
-                buf.as_mut_ptr() as *mut core::ffi::c_void,
-            )
-        };
-        if set >= 0 {
-            wrote = true;
-            continue;
-        }
-        let raw = unsafe {
-            raw_write(
-                fd,
-                buf.as_ptr() as *const core::ffi::c_void,
-                buf.len(),
-            )
-        };
-        if raw >= 0 {
+        if aura_write_dev(dev, pkt, 64) {
             wrote = true;
         }
     }
@@ -1191,7 +1229,10 @@ fn kbd_bright_set(level: u8) -> Result<String, String> {
         }
     }
 
-    let via_hid = asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
+    // TUF/I2C-HID firmware takes brightness on INPUT_ID (0x5A); modern AURA
+    // firmware (Ally) on AURA_ID (0x5D). Send both - extra packets are ignored.
+    let via_hid = asus_hidraw_write(&[0x5A, 0xBA, 0xC5, 0xC4, lvl])
+        | asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
 
     if !via_sysfs && !via_hid {
         if errors.is_empty() {
