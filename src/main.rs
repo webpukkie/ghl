@@ -158,34 +158,469 @@ fn kbd_led_dir() -> Option<PathBuf> {
     None
 }
 
-fn asus_hidraw_devs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/hidraw") else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let uevent = e.path().join("device/uevent");
-        if rd(&uevent).is_some_and(|u| u.to_ascii_uppercase().contains("0B05:")) {
-            out.push(PathBuf::from("/dev").join(e.file_name()));
+// ASUS AURA keyboard control via hidraw. The EC firmware only honors these
+// packets as feature reports (ioctl HIDIOCSFEATURE, 64-byte padded), and only
+// after the 0xB9 + "ASUS Tech.Inc." handshake; plain hidraw writes are
+// accepted by the kernel but silently ignored by the device.
+const ASUS_VENDOR_ID: u16 = 0x0B05;
+const KBD_I2C_PID: u16 = 0x19B6;
+const AURA_PIDS: &[u16] = &[
+    0x1A30, 0x1854, 0x1869, 0x1866, 0x19B6, 0x1822, 0x1837, 0x184A, 0x183D,
+    0x8502, 0x1807, 0x17E0, 0x1ABE, 0x1B4C, 0x1B6E, 0x1B2C, 0x8854, 0x1CE7,
+    0x1CE6, 0x1BF2, 0x1BF3, 0x1CD7, 0x1CD8,
+];
+
+#[repr(C)]
+struct HidrawReportDescriptor {
+    size: u32,
+    value: [u8; 4096],
+}
+
+const HIDIOCGRDESCSIZE: u64 = 0x80044801;
+const HIDIOCGRDESC: u64 = 0x90044802;
+const BUS_I2C_HID: u16 = 0x18;
+
+const fn hid_iocsfeature(len: usize) -> u64 {
+    0xC0004806u64 | ((len as u64 & 0x3FFF) << 16)
+}
+
+extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    #[link_name = "write"]
+    fn raw_write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
+}
+
+fn hid_uevent_ids(node: &str) -> Option<(u16, u16, u16)> {
+    let uev = rd(
+        PathBuf::from("/sys/class/hidraw")
+            .join(node)
+            .join("device/uevent"),
+    )?;
+    for line in uev.lines() {
+        let Some(v) = line.strip_prefix("HID_ID=") else {
+            continue;
+        };
+        let mut it = v.split(':');
+        let bus = u16::from_str_radix(it.next()?.trim(), 16).ok()?;
+        let vendor = u16::from_str_radix(it.next()?.trim(), 16).ok()?;
+        let product = u16::from_str_radix(it.next()?.trim(), 16).ok()?;
+        return Some((bus, vendor, product));
+    }
+    None
+}
+
+fn hid_desc_has_aura(fd: i32, bus: u16, pid: u16) -> bool {
+    let mut size: i32 = 0;
+    let ok = unsafe {
+        if ioctl(fd, HIDIOCGRDESCSIZE, &mut size as *mut i32) >= 0
+            && size > 0
+            && size <= 4096
+        {
+            let mut desc = HidrawReportDescriptor {
+                size: size as u32,
+                value: [0u8; 4096],
+            };
+            if ioctl(fd, HIDIOCGRDESC, &mut desc as *mut HidrawReportDescriptor) >= 0 {
+                desc.value[..size as usize]
+                    .windows(2)
+                    .any(|w| w == [0x85, 0x5D])
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    ok || (bus == BUS_I2C_HID && AURA_PIDS.contains(&pid))
+}
+
+use std::os::unix::io::AsRawFd;
+
+struct AuraDev {
+    path: PathBuf,
+    product: u16,
+    i2c: bool,
+    aura: bool,
+}
+
+fn hid_usb_parent(dev: &Path) -> Option<PathBuf> {
+    let name = dev.file_name()?.to_string_lossy().to_string();
+    let sys = PathBuf::from("/sys/class/hidraw").join(&name);
+    let mut cur = fs::canonicalize(&sys).ok()?;
+    for _ in 0..16 {
+        if !cur.starts_with("/sys/device") {
+            break;
+        }
+        let uev = rd(cur.join("uevent"))?
+            .to_ascii_uppercase();
+        if uev.contains("DEVTYPE=USB_DEVICE") {
+            let vend = rd(cur.join("idVendor")).unwrap_or_default();
+            if vend.trim() == "0b05" {
+                return Some(cur);
+            }
+            return None;
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+    None
+}
+
+fn aura_devs() -> &'static [AuraDev] {
+    static DEVS: OnceLock<Vec<AuraDev>> = OnceLock::new();
+    DEVS.get_or_init(|| {
+        let mut probes = Vec::new();
+        for i in 0..32 {
+            let node = format!("hidraw{i}");
+            let sys = PathBuf::from("/sys/class/hidraw").join(&node);
+            if !sys.exists() {
+                continue;
+            }
+            let Some((bus, vendor, product)) = hid_uevent_ids(&node) else {
+                continue;
+            };
+            if vendor != ASUS_VENDOR_ID {
+                continue;
+            }
+            let aura = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("/dev/{node}"))
+                .map(|f| hid_desc_has_aura(f.as_raw_fd(), bus, product))
+                .unwrap_or_else(|_| {
+                    bus == BUS_I2C_HID && AURA_PIDS.contains(&product)
+                });
+            probes.push((
+                hid_usb_parent(&PathBuf::from(format!("/dev/{node}"))),
+                AuraDev {
+                    path: PathBuf::from(format!("/dev/{node}")),
+                    product,
+                    i2c: bus == BUS_I2C_HID,
+                    aura,
+                },
+            ));
+        }
+        let mut out: Vec<AuraDev> = Vec::new();
+        for (parent, dev) in probes {
+            if let Some(p) = &parent {
+                if let Some(pos) = out.iter().position(|d| {
+                    hid_usb_parent(&d.path).as_ref() == Some(p)
+                }) {
+                    if dev.aura && !out[pos].aura {
+                        out[pos] = dev;
+                    }
+                    continue;
+                }
+            }
+            out.push(dev);
+        }
+        // Prefer known AURA keyboards in front so handshake targets them first.
+        out.sort_by_key(|d| !d.aura);
+        out
+    })
+}
+
+fn asus_hidraw_devs() -> Vec<String> {
+    aura_devs()
+        .iter()
+        .map(|d| {
+            format!(
+                "{}(0x{:04x},{},{},{}{})", 
+                d.path.display(),
+                d.product,
+                if d.aura { "aura" } else { "no-aura" },
+                if d.i2c { "i2c" } else { "usb" },
+                if d.aura && d.product == KBD_I2C_PID { "oobe-fix" } else { "-" },
+                if d.aura { "" } else { " [ignore]" }
+            )
+        })
+        .collect()
+}
+
+fn asus_aura_init_done() -> &'static bool {
+    static DONE: OnceLock<bool> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let mut ok = false;
+        // The FA608-series I2C-HID keyboard (0x19B6) ships in a factory
+        // "backlight OOBE" state that keeps the keyboard dark; disable it
+        // once with an exact-size (not 64-padded) feature report.
+        for d in aura_devs()
+            .iter()
+            .filter(|d| d.aura && d.product == KBD_I2C_PID && d.i2c)
+        {
+            ok |= aura_write_dev(d, &[0x46, 0x01], 2);
+        }
+        let a = aura_pkt_raw(&[0x5D, 0xB9]);
+        let mut greet = Vec::with_capacity(1 + 14);
+        greet.push(0x5D);
+        greet.extend_from_slice(b"ASUS Tech.Inc.");
+        let b = aura_pkt_raw(&greet);
+        // Dynamic-lighting init: required on the I2C-HID + asus-armoury
+        // path (FA608 chassis) before the lights respond at all.
+        for d in aura_devs().iter().filter(|d| d.aura && d.product == KBD_I2C_PID) {
+            ok |= aura_write_dev(d, &[0x5D, 0xC0, 0x03, 0x01], 64);
+        }
+        ok || a || b
+    })
+}
+
+fn asus_hidraw_write(pkt: &[u8]) -> bool {
+    asus_aura_init_done();
+    aura_pkt_raw(pkt)
+}
+
+fn aura_write_dev(dev: &AuraDev, pkt: &[u8], pad: usize) -> bool {
+    let Ok(f) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&dev.path)
+    else {
+        return false;
+    };
+    let fd = f.as_raw_fd();
+    let mut buf = [0u8; 64];
+    buf[..pkt.len().min(64)].copy_from_slice(&pkt[..pkt.len().min(64)]);
+    let size = pad.clamp(pkt.len(), 64);
+    let set = unsafe {
+        ioctl(
+            fd,
+            hid_iocsfeature(size),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+        )
+    };
+    if set >= 0 {
+        return true;
+    }
+    let raw = unsafe {
+        raw_write(
+            fd,
+            buf.as_ptr() as *const core::ffi::c_void,
+            buf.len(),
+        )
+    };
+    raw >= 0
+}
+
+fn aura_pkt_raw(pkt: &[u8]) -> bool {
+    let devs = aura_devs();
+    let mut targets: Vec<&AuraDev> = devs.iter().filter(|d| d.aura).collect();
+    if targets.is_empty() {
+        targets = devs.iter().collect();
+    }
+    let mut wrote = false;
+    for dev in targets {
+        if aura_write_dev(dev, pkt, 64) {
+            wrote = true;
+        }
+    }
+    wrote
+}
+
+// ─────────────────────────── NVIDIA GPU clocks (NVML via dlopen, no LACT) ─────
+// LACT is a whole GUI daemon just to call a handful of NVML functions. This
+// loads libnvidia-ml.so directly and talks the same API (nvmlDeviceSet-
+// GpuLockedClocks / nvmlDeviceSetClockOffsets) with zero extra dependencies.
+
+const NVML_CLOCK_GRAPHICS: u32 = 0;
+const NVML_CLOCK_MEM: u32 = 2;
+const RTLD_NOW: i32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvmlClockOffset {
+    version: u32,
+    kind: u32,   // nvmlClockType_t: 0=graphics, 2=memory
+    pstate: u32, // 0 = P-State 0 (max performance)
+    clock_offset_mhz: i32,
+    min_offset_mhz: i32,
+    max_offset_mhz: i32,
+}
+
+impl NvmlClockOffset {
+    fn new(kind: u32) -> Self {
+        // NVML_STRUCT_VERSION(ClockOffset, 1) = sizeof | (1 << 24)
+        Self {
+            version: (std::mem::size_of::<Self>() as u32) | (1u32 << 24),
+            kind,
+            pstate: 0,
+            clock_offset_mhz: 0,
+            min_offset_mhz: 0,
+            max_offset_mhz: 0,
+        }
+    }
+}
+
+unsafe fn nvml_sym<T>(lib: *mut core::ffi::c_void, name: &str) -> Option<T> {
+    extern "C" {
+        fn dlsym(handle: *mut core::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut core::ffi::c_void;
+    }
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return None;
+    };
+    let p = dlsym(lib, c.as_ptr());
+    if p.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute_copy(&p))
+    }
+}
+
+struct Nvml {
+    lib: *mut core::ffi::c_void,
+    dev: *mut core::ffi::c_void,
+    set_gpu_locked_clocks: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32) -> i32,
+    reset_gpu_locked_clocks: unsafe extern "C" fn(*mut core::ffi::c_void) -> i32,
+    reset_mem_locked_clocks: unsafe extern "C" fn(*mut core::ffi::c_void) -> i32,
+    get_clock_offsets: unsafe extern "C" fn(*mut core::ffi::c_void, *mut NvmlClockOffset) -> i32,
+    set_clock_offsets: unsafe extern "C" fn(*mut core::ffi::c_void, *mut NvmlClockOffset) -> i32,
+}
+
+impl Drop for Nvml {
+    fn drop(&mut self) {
+        extern "C" {
+            fn dlclose(handle: *mut core::ffi::c_void) -> i32;
+        }
+        unsafe {
+            if !self.lib.is_null() {
+                if let Some(sh) = nvml_sym::<unsafe extern "C" fn() -> i32>(self.lib, "nvmlShutdown") {
+                    let _ = sh();
+                }
+                dlclose(self.lib);
+            }
+        }
+    }
+}
+
+unsafe fn nvml_open() -> Result<Nvml, String> {
+    extern "C" {
+        fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut core::ffi::c_void;
+    }
+    let mut lib = dlopen(b"libnvidia-ml.so.1\0".as_ptr() as *const std::ffi::c_char, RTLD_NOW);
+    if lib.is_null() {
+        lib = dlopen(b"libnvidia-ml.so\0".as_ptr() as *const std::ffi::c_char, RTLD_NOW);
+    }
+    if lib.is_null() {
+        return Err("libnvidia-ml.so.1 not found (NVIDIA driver not installed?)".into());
+    }
+    macro_rules! bail_nvml {
+        ($msg:expr) => {{
+            let _ = nvml_sym::<unsafe extern "C" fn() -> i32>(lib, "nvmlShutdown").map(|f| f());
+            return Err($msg.into());
+        }};
+    }
+    let init: unsafe extern "C" fn() -> i32 = match nvml_sym(lib, "nvmlInit_v2") {
+        Some(f) => f,
+        None => bail_nvml!("NVML: nvmlInit_v2 not found"),
+    };
+    if init() != 0 {
+        bail_nvml!("NVML: init failed");
+    }
+    let get_handle: unsafe extern "C" fn(u32, *mut *mut core::ffi::c_void) -> i32 =
+        match nvml_sym(lib, "nvmlDeviceGetHandleByIndex_v2") {
+            Some(f) => f,
+            None => bail_nvml!("NVML: nvmlDeviceGetHandleByIndex_v2 not found"),
+        };
+    let mut dev: *mut core::ffi::c_void = std::ptr::null_mut();
+    let r = get_handle(0, &mut dev);
+    if r != 0 {
+        bail_nvml!("NVML: no NVIDIA GPU found (error {r})");
+    }
+    macro_rules! sym {
+        ($name:expr) => {
+            match nvml_sym(lib, $name) {
+                Some(f) => f,
+                None => bail_nvml!(concat!(
+                    "NVML: ",
+                    $name,
+                    " missing (NVIDIA driver 560+ required)"
+                )),
+            }
+        };
+    }
+    Ok(Nvml {
+        lib,
+        dev,
+        set_gpu_locked_clocks: sym!("nvmlDeviceSetGpuLockedClocks"),
+        reset_gpu_locked_clocks: sym!("nvmlDeviceResetGpuLockedClocks"),
+        reset_mem_locked_clocks: sym!("nvmlDeviceResetMemoryLockedClocks"),
+        get_clock_offsets: sym!("nvmlDeviceGetClockOffsets"),
+        set_clock_offsets: sym!("nvmlDeviceSetClockOffsets"),
+    })
+}
+
+fn nvml_offset_get(nv: &Nvml, kind: u32) -> Result<(i32, i32, i32), String> {
+    let mut info = NvmlClockOffset::new(kind);
+    let r = unsafe { (nv.get_clock_offsets)(nv.dev, &mut info) };
+    if r != 0 {
+        return Err(format!("NVML: could not read clock offset (error {r})"));
+    }
+    Ok((info.clock_offset_mhz, info.min_offset_mhz, info.max_offset_mhz))
+}
+
+fn nvml_offset_set(nv: &Nvml, kind: u32, offset: i32) -> Result<(), String> {
+    let mut info = NvmlClockOffset::new(kind);
+    info.clock_offset_mhz = offset;
+    let r = unsafe { (nv.set_clock_offsets)(nv.dev, &mut info) };
+    if r != 0 {
+        return Err(format!(
+            "NVML: could not set clock offset (error {r}; driver must be 560+, CoolBits not needed)"
+        ));
+    }
+    Ok(())
+}
+
+/// Persisted GPU OC state (all values None = stock).
+fn gpu_oc_apply(cfg: &mut Cfg) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.gpu_max_clock.is_none() && cfg.gpu_clock_offset.is_none() && cfg.gpu_mem_offset.is_none()
+    {
+        return out;
+    }
+    let nv = match unsafe { nvml_open() } {
+        Ok(n) => n,
+        Err(e) => {
+            out.push(format!("gpu-oc: {e}"));
+            return out;
+        }
+    };
+    if let Some(max) = cfg.gpu_max_clock {
+        let r = unsafe { (nv.set_gpu_locked_clocks)(nv.dev, 0, max) };
+        out.push(if r == 0 {
+            format!("gpu-oc: max GPU clock locked to {max} MHz")
+        } else {
+            format!("gpu-oc: failed to lock max GPU clock (NVML error {r})")
+        });
+    }
+    if let Some(o) = cfg.gpu_clock_offset {
+        out.push(match nvml_offset_set(&nv, NVML_CLOCK_GRAPHICS, o) {
+            Ok(()) => format!("gpu-oc: GPU P0 clock offset +{o} MHz"),
+            Err(e) => e,
+        });
+    }
+    if let Some(o) = cfg.gpu_mem_offset {
+        out.push(match nvml_offset_set(&nv, NVML_CLOCK_MEM, o) {
+            Ok(()) => format!("gpu-oc: VRAM P0 clock offset +{o} MHz"),
+            Err(e) => e,
+        });
     }
     out
 }
 
-fn asus_hidraw_write(pkt: &[u8]) -> bool {
-    let mut buf = [0u8; 64];
-    let len = pkt.len().min(64);
-    buf[..len].copy_from_slice(&pkt[..len]);
-
-    let mut wrote = false;
-    for dev in asus_hidraw_devs() {
-        if let Ok(mut f) = OpenOptions::new().write(true).open(&dev) {
-            if f.write_all(&buf).is_ok() {
-                wrote = true;
-            }
+fn gpu_oc_status() -> Vec<String> {
+    let mut out = Vec::new();
+    let nv = match unsafe { nvml_open() } {
+        Ok(n) => n,
+        Err(e) => {
+            out.push(format!("gpu-oc    : n/a ({e})"));
+            return out;
         }
-    }
-    wrote
+    };
+    let (gcur, gmin, gmax) = nvml_offset_get(&nv, NVML_CLOCK_GRAPHICS)
+        .unwrap_or((0, 0, 0));
+    let (mcur, mmin, mmax) = nvml_offset_get(&nv, NVML_CLOCK_MEM).unwrap_or((0, 0, 0));
+    out.push(format!(
+        "gpu-oc    : P0 core offset {gcur} MHz (range {gmin}..{gmax}), P0 VRAM offset {mcur} MHz (range {mmin}..{mmax})"
+    ));
+    out
 }
 
 fn parse_toggle(s: &str) -> Option<bool> {
@@ -876,16 +1311,54 @@ fn cpu_boost_set(on: bool) -> Result<(), String> {
 }
 
 /// Default boost policy: Silent disables boost; Balanced and Turbo enable it.
-/// `cpu_boost=on|off` in ghl.conf is an explicit override; `cpuboost auto`
-/// clears that override and returns to this mode-dependent policy.
-fn cpu_boost_for_mode(mode: Mode) -> bool {
+fn cpu_boost_default_for_mode(mode: Mode) -> bool {
     !matches!(mode, Mode::Silent)
 }
 
+/// Resolve boost for one mode: per-mode override `cpu_boost.<mode>=on|off`
+/// wins, then the global `cpu_boost=on|off` override, else the default
+/// mode-dependent policy. Returns (enabled, overridden).
+fn cpu_boost_resolve_for_mode(mode: Mode, cfg: &Cfg) -> (bool, bool) {
+    if let Some(b) = cfg.cpu_boost_modes.get(&mode) {
+        (*b, true)
+    } else if let Some(b) = cfg.cpu_boost {
+        (b, true)
+    } else {
+        (cpu_boost_default_for_mode(mode), false)
+    }
+}
+
+fn cpu_boost_for_mode(mode: Mode, cfg: &Cfg) -> bool {
+    cpu_boost_resolve_for_mode(mode, cfg).0
+}
+
 fn cpu_boost_apply_for_mode(mode: Mode, cfg: &Cfg) -> Result<bool, String> {
-    let enabled = cfg.cpu_boost.unwrap_or_else(|| cpu_boost_for_mode(mode));
+    let enabled = cpu_boost_for_mode(mode, cfg);
     cpu_boost_set(enabled)?;
     Ok(enabled)
+}
+
+/// CLI: `ghl cpuboost <mode> on|off|auto`.
+fn cpu_boost_cli_set(cfg: &mut Cfg, m: Mode, v: &str) -> Result<(), String> {
+    let current = cfg.mode.or_else(mode_current);
+    if v == "auto" {
+        cfg.cpu_boost_modes.remove(&m);
+        if current == Some(m) {
+            let enabled = cpu_boost_apply_for_mode(m, cfg)?;
+            println!("cpu boost {} ({} mode policy)", on_off(enabled), m.name());
+        } else {
+            println!("cpu boost for {} mode set to automatic", m.name());
+        }
+    } else {
+        let on = parse_toggle(v).ok_or("cpuboost: [mode] on|off|auto")?;
+        cfg.cpu_boost_modes.insert(m, on);
+        if current == Some(m) {
+            cpu_boost_set(on)?;
+        }
+        println!("cpu boost {} for {} mode", on_off(on), m.name());
+    }
+    cfg.save()?;
+    Ok(())
 }
 
 // ───────────────────────── Panel Overdrive ─────────────────────────
@@ -934,35 +1407,60 @@ fn kbd_bright_get() -> Option<u8> {
 fn kbd_bright_set(level: u8) -> Result<String, String> {
     let lvl = level.min(3);
     let mut errors = Vec::new();
+    let mut via_sysfs = false;
 
-    // Try the LED class first, but never let a failed sysfs write prevent
-    // the ASUS HID report fallback from being attempted.
+    // LED class writes can succeed without the EC actually lighting the
+    // keyboard on some models, so the ASUS HID report is always sent too.
     if let Some(dir) = kbd_led_dir() {
         let p = dir.join("brightness");
         if p.exists() {
             match wr(&p, lvl.to_string()) {
-                Ok(()) => {
-                    return Ok(format!(
-                        "kbd brightness: {} ({lvl}/3) via sysfs",
-                        KBD_BRIGHT_LABELS[lvl as usize]
-                    ));
-                }
+                Ok(()) => via_sysfs = true,
                 Err(e) => errors.push(e),
             }
         }
+        // On TUF models the EC keeps the keyboard dark unless the "awake"
+        // lighting state is enabled, even with brightness > 0.
+        let state = dir.join("kbd_rgb_state");
+        if state.exists() {
+            let cur: Option<String> = rd(&state);
+            let mut toks: Vec<String> = cur
+                .as_deref()
+                .unwrap_or("1 1 0 0 0")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            toks.resize(5, "0".into());
+            toks[0] = "1".into();
+            toks[2] = "1".into();
+            let _ = wr(&state, toks.join(" "));
+        }
     }
 
-    if asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]) {
-        return Ok(format!(
-            "kbd brightness: {} ({lvl}/3) via ASUS HID",
-            KBD_BRIGHT_LABELS[lvl as usize]
-        ));
-    }
+    // TUF/I2C-HID firmware takes brightness on INPUT_ID (0x5A); modern AURA
+    // firmware (Ally) on AURA_ID (0x5D). Send both - extra packets are ignored.
+    let via_hid = asus_hidraw_write(&[0x5A, 0xBA, 0xC5, 0xC4, lvl])
+        | asus_hidraw_write(&[0x5D, 0xBA, 0xC5, 0xC4, lvl]);
 
-    if errors.is_empty() {
-        Err("keyboard backlight interface not found (LED sysfs and ASUS HID unavailable)".into())
+    if !via_sysfs && !via_hid {
+        if errors.is_empty() {
+            Err("keyboard backlight interface not found (LED sysfs and ASUS HID unavailable)".into())
+        } else {
+            Err(format!("keyboard backlight failed: {}", errors.join("; ")))
+        }
     } else {
-        Err(format!("keyboard backlight failed: {}", errors.join("; ")))
+        let mut method = Vec::new();
+        if via_sysfs {
+            method.push("sysfs");
+        }
+        if via_hid {
+            method.push("HID");
+        }
+        Ok(format!(
+            "kbd brightness: {} ({lvl}/3) via {}",
+            KBD_BRIGHT_LABELS[lvl as usize],
+            method.join("+")
+        ))
     }
 }
 
@@ -1056,19 +1554,29 @@ fn kbd_color_set(c: Rgb) -> Result<String, String> {
         }
     }
 
-    if !applied {
+    // Apply the HID color report even when a sysfs path succeeded: on many
+    // models the EC only honors this packet and ignores multi_intensity.
+    let mut hid = false;
+    {
         let msg = [
             0x5D, 0xB3, 0x00, 0x00, c.0, c.1, c.2, 0x00, 0x00, 0x00, c.0, c.1, c.2,
         ];
         if asus_hidraw_write(&msg) {
             let _ = asus_hidraw_write(&[0x5D, 0xB5, 0, 0, 0]);
             let _ = asus_hidraw_write(&[0x5D, 0xB4]);
-            applied = true;
+            hid = true;
         }
     }
 
-    if applied {
-        Ok(format!("kbd color: {}", c.label()))
+    if applied || hid {
+        let mut method = Vec::new();
+        if applied {
+            method.push("sysfs");
+        }
+        if hid {
+            method.push("HID");
+        }
+        Ok(format!("kbd color: {} via {}", c.label(), method.join("+")))
     } else {
         Err("keyboard RGB interface (multi_intensity / kbd_rgb_mode / hidraw) not found".into())
     }
@@ -1678,6 +2186,14 @@ fn running_game_candidates() -> Vec<String> {
     out
 }
 
+fn gamemode_daemon_alive() -> bool {
+    fs::read_to_string("/run/ghl-gamemode.pid")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        .unwrap_or(false)
+}
+
 fn run_gamemode_daemon() {
     let restore_path = "/run/ghl-gamemode.state";
     let pid_path = "/run/ghl-gamemode.pid";
@@ -2241,6 +2757,7 @@ struct Cfg {
     autobright: bool,
     nv_power_fix: bool,
     cpu_boost: Option<bool>,
+    cpu_boost_modes: BTreeMap<Mode, bool>,
     panel_od: Option<bool>,
     disable_igpu_dgpu: bool,
     disable_npu: bool,
@@ -2248,6 +2765,9 @@ struct Cfg {
     kbd_color: Option<Rgb>,
     webcam: Option<bool>,
     touchpad: Option<bool>,
+    gpu_max_clock: Option<u32>,
+    gpu_clock_offset: Option<i32>,
+    gpu_mem_offset: Option<i32>,
     ryzen: RyzenCfg,
     curves: BTreeMap<(Mode, u8), Curve>,
     game_rules: Vec<GameRule>,
@@ -2277,6 +2797,9 @@ impl Cfg {
                 "kbd_color" => c.kbd_color = Rgb::parse(v),
                 "webcam" => c.webcam = parse_toggle(v),
                 "touchpad" => c.touchpad = parse_toggle(v),
+                "gpu_max_clock" => c.gpu_max_clock = v.parse().ok(),
+                "gpu_clock_offset" => c.gpu_clock_offset = v.parse().ok(),
+                "gpu_mem_offset" => c.gpu_mem_offset = v.parse().ok(),
                 "game_mode" => c.game_mode = Mode::parse(v),
                 "game_rule" => {
                     if let Some(r) = GameRule::parse(v) {
@@ -2284,7 +2807,11 @@ impl Cfg {
                     }
                 }
                 _ => {
-                    if let Some(rk) = k.strip_prefix("ryzen.") {
+                    if let Some(rest) = k.strip_prefix("cpu_boost.") {
+                        if let (Some(m), Some(b)) = (Mode::parse(rest), parse_toggle(v)) {
+                            c.cpu_boost_modes.insert(m, b);
+                        }
+                    } else if let Some(rk) = k.strip_prefix("ryzen.") {
                         let _ = c.ryzen.set_by_key(rk, v);
                     } else if let Some(rest) = k.strip_prefix("fan.") {
                         if let Some((m_str, n_str)) = rest.split_once('.') {
@@ -2326,6 +2853,9 @@ impl Cfg {
         if let Some(b) = self.cpu_boost {
             let _ = writeln!(s, "cpu_boost={}", u8::from(b));
         }
+        for (m, b) in &self.cpu_boost_modes {
+            let _ = writeln!(s, "cpu_boost.{}={}", m.name(), u8::from(*b));
+        }
         if let Some(od) = self.panel_od {
             let _ = writeln!(s, "panel_od={}", u8::from(od));
         }
@@ -2340,6 +2870,15 @@ impl Cfg {
         }
         if let Some(tp) = self.touchpad {
             let _ = writeln!(s, "touchpad={}", u8::from(tp));
+        }
+        if let Some(v) = self.gpu_max_clock {
+            let _ = writeln!(s, "gpu_max_clock={v}");
+        }
+        if let Some(v) = self.gpu_clock_offset {
+            let _ = writeln!(s, "gpu_clock_offset={v}");
+        }
+        if let Some(v) = self.gpu_mem_offset {
+            let _ = writeln!(s, "gpu_mem_offset={v}");
         }
         for (idx, meta) in RYZEN_FIELDS.iter().enumerate() {
             if let Some(val) = self.ryzen.slot(idx) {
@@ -2444,12 +2983,18 @@ fn apply(cfg: &mut Cfg) -> Vec<String> {
         Err(e) => out.push(format!("error: {e}")),
     };
     note(ab_set(cfg.autobright).map(|_| format!("auto-brightness {}", on_off(cfg.autobright))));
-    if let Some(b) = cfg.cpu_boost {
-        note(cpu_boost_set(b).map(|_| format!("cpu boost override {}", on_off(b))));
-    } else if let Some(m) = cfg.mode.or_else(mode_current) {
-        note(cpu_boost_apply_for_mode(m, cfg).map(|b| {
-            format!("cpu boost {} ({} mode policy)", on_off(b), m.name())
+    if let Some(m) = cfg.mode.or_else(mode_current) {
+        let (b, overridden) = cpu_boost_resolve_for_mode(m, cfg);
+        note(cpu_boost_set(b).map(|_| {
+            format!(
+                "cpu boost {} ({} mode {})",
+                on_off(b),
+                m.name(),
+                if overridden { "override" } else { "policy" }
+            )
         }));
+    } else if let Some(b) = cfg.cpu_boost {
+        note(cpu_boost_set(b).map(|_| format!("cpu boost override {}", on_off(b))));
     }
     if let Some(od) = cfg.panel_od {
         note(panel_od_set(od));
@@ -2494,6 +3039,11 @@ fn apply(cfg: &mut Cfg) -> Vec<String> {
     }
     if cfg.disable_npu {
         note(npu_apply(true, cfg.disable_igpu_dgpu));
+    }
+    // After GPU topology changes (mode switch re-enumerates the dGPU and
+    // drops clock settings), before anything else that could reset it again.
+    for l in gpu_oc_apply(cfg) {
+        note(Ok(l));
     }
     if let Some(m) = cfg.mode {
         note(mode_set(m, cfg));
@@ -2574,16 +3124,49 @@ fn status(cfg: &Cfg) {
         "cpu-boost  : {}",
         cpu_boost_get().map_or("unsupported", on_off)
     );
-    println!(
-        "kbd-bright : {}",
-        kbd_bright_get().map_or_else(
-            || "unsupported".into(),
-            |lvl| format!("{} ({lvl}/3)", KBD_BRIGHT_LABELS[lvl as usize])
-        )
-    );
+    for m in MODES {
+        if let Some(b) = cfg.cpu_boost_modes.get(&m) {
+            println!("             {} mode override: {}", m.name(), on_off(*b));
+        }
+    }
+    match kbd_led_dir() {
+        Some(dir) => {
+            println!(
+                "kbd-bright : {} (led: {}, max: {})",
+                kbd_bright_get().map_or_else(
+                    || "unknown".into(),
+                    |lvl| format!("{} ({lvl}/3)", KBD_BRIGHT_LABELS[lvl as usize])
+                ),
+                dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().to_string()),
+                rd(dir.join("max_brightness")).unwrap_or_else(|| "?".into()).trim()
+            );
+            for f in ["kbd_rgb_mode", "kbd_rgb_state", "multi_intensity"] {
+                if dir.join(f).exists() {
+                    println!(
+                        "             {f}: {}",
+                        rd(dir.join(f)).unwrap_or_else(|| "?".into()).trim()
+                    );
+                }
+            }
+        }
+        None => println!("kbd-bright : unsupported (no kbd_backlight LED found)"),
+    }
     println!(
         "kbd-color  : {}",
         kbd_color_get(cfg).map_or_else(|| "default".into(), |c| c.label())
+    );
+    let hids = asus_hidraw_devs();
+    println!(
+        "asus-hidraw: {}",
+        if hids.is_empty() {
+            "none found".to_string()
+        } else {
+            hids
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
     );
     println!(
         "webcam     : {}",
@@ -2595,6 +3178,9 @@ fn status(cfg: &Cfg) {
     );
     println!("cpu stats  :{}", cpu.fmt_line("CPU"));
     println!("gpu stats  :{}", gpu.fmt_line("GPU"));
+    for l in gpu_oc_status() {
+        println!("{l}");
+    }
     println!("fan rpm    : {:?}", fan_rpm());
     for (n, l) in fan_list() {
         if let Some(c) = fan_read(n) {
@@ -2665,12 +3251,17 @@ fn usage() {
          ghl fan default                                      (back to firmware curve)\n\
          ghl kbdbright 0|1|2|3|off|low|med|high\n\
          ghl kbdcolor <RRGGBB | R G B | R,G,B>\n\
+         ghl gpuoc                                            (show GPU clock offsets/caps)\n\
+         ghl gpuoc max <mhz>                                  (cap max GPU clock; 0 = remove)\n\
+         ghl gpuoc offset <±mhz>                              (GPU P-State 0 core offset)\n\
+         ghl gpuoc mem-offset <±mhz>                          (VRAM P-State 0 offset)\n\
+         ghl gpuoc clear                                      (reset all to stock)\n\
          ghl overdrive on|off\n\
          ghl webcam on|off\n\
          ghl touchpad on|off\n\
          ghl autobright on|off\n\
          ghl nvfix on|off|apply\n\
-         ghl cpuboost on|off\n\
+         ghl cpuboost [silent|balanced|turbo] on|off|auto   (per-mode boost, no mode = current)\n\
          ghl apply                                            (restore saved config at boot)\n\
          ghl gamemode status|list|running\n\
          ghl gamemode daemon                                  (run auto-perf loop, use with systemd)\n\
@@ -2811,6 +3402,13 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             for l in apply(cfg) {
                 println!("{l}");
             }
+            if cfg.game_rules.iter().any(|r| r.enabled) && !gamemode_daemon_alive() {
+                eprintln!(
+                    "note: game rules are enabled but the gamemode daemon is not running -\n\
+                     games will NOT switch performance modes automatically\n\
+                     install/start it once: sudo ghl gamemode service"
+                );
+            }
         }
         ["ryzen" | "ryzenadj", ref rest @ ..] => run_ryzen_cli(rest, cfg)?,
         ["gpu", g] => {
@@ -2850,6 +3448,92 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             println!("{}", kbd_color_set(rgb)?);
             cfg.save()?;
         }
+        ["gpuoc" | "gpu-oc"] => {
+            for l in gpu_oc_status() {
+                println!("{l}");
+            }
+            println!(
+                "  configured: max_clock={:?} gpu_offset={:?} mem_offset={:?}",
+                cfg.gpu_max_clock, cfg.gpu_clock_offset, cfg.gpu_mem_offset
+            );
+            println!(
+                "  usage: ghl gpuoc max <mhz> | offset <±mhz> | mem-offset <±mhz> | clear"
+            );
+        }
+        ["gpuoc" | "gpu-oc", "max", v] => {
+            let mhz: u32 = v
+                .parse()
+                .map_err(|_| "gpuoc max: give MHz, e.g. ghl gpuoc max 2900 (0 = remove cap)".to_string())?;
+            if mhz == 0 {
+                cfg.gpu_max_clock = None;
+                let nv = unsafe { nvml_open() }?;
+                let r = unsafe { (nv.reset_gpu_locked_clocks)(nv.dev) };
+                println!(
+                    "{}",
+                    if r == 0 {
+                        "gpu-oc: GPU clock lock removed"
+                    } else {
+                        "gpu-oc: failed to unlock GPU clocks"
+                    }
+                );
+            } else {
+                cfg.gpu_max_clock = Some(mhz);
+                let nv = unsafe { nvml_open() }?;
+                let r = unsafe { (nv.set_gpu_locked_clocks)(nv.dev, 0, mhz) };
+                if r != 0 {
+                    return Err(format!(
+                        "gpuoc: NVML rejected max clock {mhz} (error {r})"
+                    ));
+                }
+                println!("gpu-oc: max GPU clock locked to {mhz} MHz (min uncapped)");
+            }
+            cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc", "offset", v] => {
+            let o: i32 = v
+                .trim_start_matches('+')
+                .parse()
+                .map_err(|_| "gpuoc offset: give MHz, e.g. +400 or -200 (0 = none)".to_string())?;
+            cfg.gpu_clock_offset = if o == 0 { None } else { Some(o) };
+            let nv = unsafe { nvml_open() }?;
+            let (_, gmin, gmax) = nvml_offset_get(&nv, NVML_CLOCK_GRAPHICS)?;
+            let clamped = o.clamp(gmin, gmax);
+            if clamped != o {
+                println!("gpu-oc: note: offset clamped to driver range {gmin}..{gmax} MHz");
+            }
+            nvml_offset_set(&nv, NVML_CLOCK_GRAPHICS, clamped)?;
+            println!("gpu-oc: GPU P-State 0 clock offset set to {clamped} MHz");
+            cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc", "mem-offset" | "memoffset" | "mem", v] => {
+            let o: i32 = v
+                .trim_start_matches('+')
+                .parse()
+                .map_err(|_| "gpuoc mem-offset: give MHz, e.g. +2500 or -500 (0 = none)".to_string())?;
+            cfg.gpu_mem_offset = if o == 0 { None } else { Some(o) };
+            let nv = unsafe { nvml_open() }?;
+            let (_, mmin, mmax) = nvml_offset_get(&nv, NVML_CLOCK_MEM)?;
+            let clamped = o.clamp(mmin, mmax);
+            if clamped != o {
+                println!("gpu-oc: note: offset clamped to driver range {mmin}..{mmax} MHz");
+            }
+            nvml_offset_set(&nv, NVML_CLOCK_MEM, clamped)?;
+            println!("gpu-oc: VRAM P-State 0 clock offset set to {clamped} MHz");
+            cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc", "clear"] => {
+            cfg.gpu_max_clock = None;
+            cfg.gpu_clock_offset = None;
+            cfg.gpu_mem_offset = None;
+            if let Ok(nv) = unsafe { nvml_open() } {
+                let _ = unsafe { (nv.reset_gpu_locked_clocks)(nv.dev) };
+                let _ = unsafe { (nv.reset_mem_locked_clocks)(nv.dev) };
+                let _ = nvml_offset_set(&nv, NVML_CLOCK_GRAPHICS, 0);
+                let _ = nvml_offset_set(&nv, NVML_CLOCK_MEM, 0);
+            }
+            cfg.save()?;
+            println!("gpu-oc: all GPU clock settings cleared and reset to stock");
+        }
         ["kbdcolor", r, g, b] => {
             let rgb = Rgb::parse(&format!("{r},{g},{b}"))
                 .ok_or("kbdcolor: R G B values must be 0..255")?;
@@ -2881,8 +3565,13 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             ab_set(on)?;
             cfg.save()?;
         }
+        ["cpuboost", m_str, v] if Mode::parse(m_str).is_some() => {
+            let m = Mode::parse(m_str).ok_or("cpuboost: [mode] on|off|auto")?;
+            cpu_boost_cli_set(cfg, m, v)?;
+        }
         ["cpuboost", "auto"] => {
             cfg.cpu_boost = None;
+            cfg.cpu_boost_modes.clear();
             if let Some(m) = cfg.mode.or_else(mode_current) {
                 let enabled = cpu_boost_apply_for_mode(m, &cfg)?;
                 println!("cpu boost {} ({} mode policy)", on_off(enabled), m.name());
@@ -2892,11 +3581,20 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             cfg.save()?;
         }
         ["cpuboost", v] => {
-            let on = parse_toggle(v).ok_or("cpuboost: on|off|auto")?;
-            cfg.cpu_boost = Some(on);
-            cpu_boost_set(on)?;
+            let on = parse_toggle(v).ok_or("cpuboost: [mode] on|off|auto")?;
+            match cfg.mode.or_else(mode_current) {
+                Some(m) => {
+                    cfg.cpu_boost_modes.insert(m, on);
+                    cpu_boost_set(on)?;
+                    println!("cpu boost {} for {} mode", on_off(on), m.name());
+                }
+                None => {
+                    cfg.cpu_boost = Some(on);
+                    cpu_boost_set(on)?;
+                    println!("cpu boost override {}", on_off(on));
+                }
+            }
             cfg.save()?;
-            println!("cpu boost override {}", on_off(on));
         }
         ["nvfix" | "nv-fix", "apply"] => {
             println!("{}", nv_fix_apply()?);
@@ -2950,9 +3648,45 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
                     } else {
                         println!("active           : no");
                     }
-                    let pid_path = "/run/ghl-gamemode.pid";
-                    if let Ok(p) = fs::read_to_string(pid_path) {
-                        println!("daemon pid       : {}", p.trim());
+                    if gamemode_daemon_alive() {
+                        println!("daemon           : running");
+                    } else {
+                        let unit = Path::new("/etc/systemd/system/ghl-gamemode.service").exists();
+                        println!("daemon           : NOT running - game rules will not auto-apply");
+                        if unit {
+                            println!("                   fix: sudo systemctl start ghl-gamemode");
+                        } else {
+                            println!("                   fix: sudo ghl gamemode service");
+                        }
+                    }
+                    if enabled_count > 0 {
+                        let rules: Vec<GameRule> = cfg
+                            .game_rules
+                            .iter()
+                            .filter(|r| r.enabled)
+                            .cloned()
+                            .collect();
+                        let matched = scan_procs(&rules);
+                        println!(
+                            "current detection: {}",
+                            if matched {
+                                "MATCH - enabled rules see a running game"
+                            } else {
+                                "no running game matches enabled rules"
+                            }
+                        );
+                        if !matched {
+                            let running = running_game_candidates();
+                            if !running.is_empty() {
+                                println!(
+                                    "                   running candidates: {}",
+                                    running.join(", ")
+                                );
+                            }
+                        }
+                    }
+                    if let Some(m) = mode_current() {
+                        println!("current mode     : {}", m.name());
                     }
                 }
                 ["daemon"] => {
@@ -3464,7 +4198,24 @@ impl App {
                 let fan_name = self.fans.get(self.fan_i).map_or("unsupported", |f| f.1);
                 line(out, &mut y, format!(" Performance mode: {}   (←→ change mode)", modes.join(" ")), self.pt == 0)?;
                 let boost = cpu_boost_get().map_or("unsupported", on_off_upper);
-                let policy = if self.cfg.cpu_boost.is_some() { "manual override" } else { "automatic by mode" };
+                let policy = if self.cfg.cpu_boost_modes.is_empty() && self.cfg.cpu_boost.is_none() {
+                    "automatic by mode".to_string()
+                } else {
+                    MODES
+                        .iter()
+                        .map(|mode| {
+                            let b = self
+                                .cfg
+                                .cpu_boost_modes
+                                .get(mode)
+                                .copied()
+                                .or(self.cfg.cpu_boost)
+                                .unwrap_or_else(|| cpu_boost_default_for_mode(*mode));
+                            format!("{}:{}", mode.name(), on_off(b))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
                 line(out, &mut y, format!(" CPU boost: {boost} ({policy})   [b] toggle / [a] auto"), self.pt == 1)?;
                 line(out, &mut y, format!(" Fan curve: {fan_name}"), false)?;
                 for (i, (t, p)) in self.curve.iter().enumerate() {
@@ -3790,10 +4541,11 @@ impl App {
                             self.report(r);
                             self.load_curve();
                         } else if self.pt == 1 {
+                            let m = self.mode_cur.unwrap_or(Mode::Balanced);
                             let next = dir > 0;
-                            self.cfg.cpu_boost = Some(next);
+                            self.cfg.cpu_boost_modes.insert(m, next);
                             let r = cpu_boost_set(next).and_then(|_| self.cfg.save())
-                                .map(|_| format!("CPU boost {} (manual override)", on_off(next)));
+                                .map(|_| format!("CPU boost {} ({} mode)", on_off(next), m.name()));
                             self.report(r);
                         } else {
                             let i = self.pt - 2;
@@ -3801,14 +4553,16 @@ impl App {
                         }
                     }
                     KeyCode::Char('b') | KeyCode::Char(' ') | KeyCode::Enter if self.pt == 1 => {
+                        let m = self.mode_cur.unwrap_or(Mode::Balanced);
                         let next = !cpu_boost_get().unwrap_or(true);
-                        self.cfg.cpu_boost = Some(next);
-                        let r = cpu_boost_set(next).and_then(|_| self.cfg.save()).map(|_| format!("CPU boost {} (manual override)", on_off(next)));
+                        self.cfg.cpu_boost_modes.insert(m, next);
+                        let r = cpu_boost_set(next).and_then(|_| self.cfg.save()).map(|_| format!("CPU boost {} ({} mode)", on_off(next), m.name()));
                         self.report(r);
                     }
                     KeyCode::Char('a') => {
-                        self.cfg.cpu_boost = None;
                         let m = self.mode_cur.unwrap_or(Mode::Balanced);
+                        self.cfg.cpu_boost_modes.remove(&m);
+                        self.cfg.cpu_boost = None;
                         let r = cpu_boost_apply_for_mode(m, &self.cfg)
                             .and_then(|enabled| self.cfg.save().map(|_| format!("CPU boost {} (automatic mode policy)", on_off(enabled))));
                         self.report(r);
@@ -4089,7 +4843,9 @@ fn main() {
     || (matches!(
             args.first().map(String::as_str),
             Some("gamemode" | "game-mode")
-        ) && matches!(args.get(1).map(String::as_str), Some("status" | "list" | "running")));
+        ) && matches!(args.get(1).map(String::as_str), Some("status" | "list" | "running")))
+    || (matches!(args.first().map(String::as_str), Some("gpuoc" | "gpu-oc"))
+        && (args.len() == 1 || matches!(args.get(1).map(String::as_str), None | Some(""))));
     let euid = fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(1);
     if euid != 0 && !read_only {
         let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("ghl"));
@@ -4101,12 +4857,21 @@ fn main() {
         if let Ok(exe) = env::current_exe() {
             let sys_bin = Path::new("/usr/local/bin/ghl");
             if exe != sys_bin && Path::new("/usr/local/bin").exists() {
-                let _ = fs::copy(&exe, sys_bin);
+                // A direct copy fails with "Text file busy" when the gamemode
+                // daemon still runs from that file; copy+rename replaces the
+                // inode instead and works on a live binary.
+                let tmp = Path::new("/usr/local/bin/.ghl.tmp");
+                if fs::copy(&exe, tmp).and_then(|_| fs::rename(tmp, sys_bin)).is_err() {
+                    let _ = fs::copy(&exe, sys_bin);
+                }
             }
             if let Some((ref user, _)) = session_user_env() {
                 let user_bin = PathBuf::from(format!("/home/{user}/.local/bin/ghl"));
                 if user_bin.exists() && exe != user_bin {
-                    let _ = fs::copy(&exe, &user_bin);
+                    let tmp = user_bin.with_extension("tmp");
+                    if fs::copy(&exe, &tmp).and_then(|_| fs::rename(&tmp, &user_bin)).is_err() {
+                        let _ = fs::copy(&exe, &user_bin);
+                    }
                 }
             }
         }
