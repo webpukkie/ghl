@@ -4857,12 +4857,21 @@ fn main() {
         if let Ok(exe) = env::current_exe() {
             let sys_bin = Path::new("/usr/local/bin/ghl");
             if exe != sys_bin && Path::new("/usr/local/bin").exists() {
-                let _ = fs::copy(&exe, sys_bin);
+                // A direct copy fails with "Text file busy" when the gamemode
+                // daemon still runs from that file; copy+rename replaces the
+                // inode instead and works on a live binary.
+                let tmp = Path::new("/usr/local/bin/.ghl.tmp");
+                if fs::copy(&exe, tmp).and_then(|_| fs::rename(tmp, sys_bin)).is_err() {
+                    let _ = fs::copy(&exe, sys_bin);
+                }
             }
             if let Some((ref user, _)) = session_user_env() {
                 let user_bin = PathBuf::from(format!("/home/{user}/.local/bin/ghl"));
                 if user_bin.exists() && exe != user_bin {
-                    let _ = fs::copy(&exe, &user_bin);
+                    let tmp = user_bin.with_extension("tmp");
+                    if fs::copy(&exe, &tmp).and_then(|_| fs::rename(&tmp, &user_bin)).is_err() {
+                        let _ = fs::copy(&exe, &user_bin);
+                    }
                 }
             }
         }
