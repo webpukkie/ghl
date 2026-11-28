@@ -415,6 +415,214 @@ fn aura_pkt_raw(pkt: &[u8]) -> bool {
     wrote
 }
 
+// ─────────────────────────── NVIDIA GPU clocks (NVML via dlopen, no LACT) ─────
+// LACT is a whole GUI daemon just to call a handful of NVML functions. This
+// loads libnvidia-ml.so directly and talks the same API (nvmlDeviceSet-
+// GpuLockedClocks / nvmlDeviceSetClockOffsets) with zero extra dependencies.
+
+const NVML_CLOCK_GRAPHICS: u32 = 0;
+const NVML_CLOCK_MEM: u32 = 2;
+const RTLD_NOW: i32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvmlClockOffset {
+    version: u32,
+    kind: u32,   // nvmlClockType_t: 0=graphics, 2=memory
+    pstate: u32, // 0 = P-State 0 (max performance)
+    clock_offset_mhz: i32,
+    min_offset_mhz: i32,
+    max_offset_mhz: i32,
+}
+
+impl NvmlClockOffset {
+    fn new(kind: u32) -> Self {
+        // NVML_STRUCT_VERSION(ClockOffset, 1) = sizeof | (1 << 24)
+        Self {
+            version: (std::mem::size_of::<Self>() as u32) | (1u32 << 24),
+            kind,
+            pstate: 0,
+            clock_offset_mhz: 0,
+            min_offset_mhz: 0,
+            max_offset_mhz: 0,
+        }
+    }
+}
+
+unsafe fn nvml_sym<T>(lib: *mut core::ffi::c_void, name: &str) -> Option<T> {
+    extern "C" {
+        fn dlsym(handle: *mut core::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut core::ffi::c_void;
+    }
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return None;
+    };
+    let p = dlsym(lib, c.as_ptr());
+    if p.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute_copy(&p))
+    }
+}
+
+struct Nvml {
+    lib: *mut core::ffi::c_void,
+    dev: *mut core::ffi::c_void,
+    set_gpu_locked_clocks: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32) -> i32,
+    reset_gpu_locked_clocks: unsafe extern "C" fn(*mut core::ffi::c_void) -> i32,
+    reset_mem_locked_clocks: unsafe extern "C" fn(*mut core::ffi::c_void) -> i32,
+    get_clock_offsets: unsafe extern "C" fn(*mut core::ffi::c_void, *mut NvmlClockOffset) -> i32,
+    set_clock_offsets: unsafe extern "C" fn(*mut core::ffi::c_void, *mut NvmlClockOffset) -> i32,
+}
+
+impl Drop for Nvml {
+    fn drop(&mut self) {
+        extern "C" {
+            fn dlclose(handle: *mut core::ffi::c_void) -> i32;
+        }
+        unsafe {
+            if !self.lib.is_null() {
+                if let Some(sh) = nvml_sym::<unsafe extern "C" fn() -> i32>(self.lib, "nvmlShutdown") {
+                    let _ = sh();
+                }
+                dlclose(self.lib);
+            }
+        }
+    }
+}
+
+unsafe fn nvml_open() -> Result<Nvml, String> {
+    extern "C" {
+        fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut core::ffi::c_void;
+    }
+    let mut lib = dlopen(b"libnvidia-ml.so.1\0".as_ptr() as *const std::ffi::c_char, RTLD_NOW);
+    if lib.is_null() {
+        lib = dlopen(b"libnvidia-ml.so\0".as_ptr() as *const std::ffi::c_char, RTLD_NOW);
+    }
+    if lib.is_null() {
+        return Err("libnvidia-ml.so.1 not found (NVIDIA driver not installed?)".into());
+    }
+    macro_rules! bail_nvml {
+        ($msg:expr) => {{
+            let _ = nvml_sym::<unsafe extern "C" fn() -> i32>(lib, "nvmlShutdown").map(|f| f());
+            return Err($msg.into());
+        }};
+    }
+    let init: unsafe extern "C" fn() -> i32 = match nvml_sym(lib, "nvmlInit_v2") {
+        Some(f) => f,
+        None => bail_nvml!("NVML: nvmlInit_v2 not found"),
+    };
+    if init() != 0 {
+        bail_nvml!("NVML: init failed");
+    }
+    let get_handle: unsafe extern "C" fn(u32, *mut *mut core::ffi::c_void) -> i32 =
+        match nvml_sym(lib, "nvmlDeviceGetHandleByIndex_v2") {
+            Some(f) => f,
+            None => bail_nvml!("NVML: nvmlDeviceGetHandleByIndex_v2 not found"),
+        };
+    let mut dev: *mut core::ffi::c_void = std::ptr::null_mut();
+    let r = get_handle(0, &mut dev);
+    if r != 0 {
+        bail_nvml!("NVML: no NVIDIA GPU found (error {r})");
+    }
+    macro_rules! sym {
+        ($name:expr) => {
+            match nvml_sym(lib, $name) {
+                Some(f) => f,
+                None => bail_nvml!(concat!(
+                    "NVML: ",
+                    $name,
+                    " missing (NVIDIA driver 560+ required)"
+                )),
+            }
+        };
+    }
+    Ok(Nvml {
+        lib,
+        dev,
+        set_gpu_locked_clocks: sym!("nvmlDeviceSetGpuLockedClocks"),
+        reset_gpu_locked_clocks: sym!("nvmlDeviceResetGpuLockedClocks"),
+        reset_mem_locked_clocks: sym!("nvmlDeviceResetMemoryLockedClocks"),
+        get_clock_offsets: sym!("nvmlDeviceGetClockOffsets"),
+        set_clock_offsets: sym!("nvmlDeviceSetClockOffsets"),
+    })
+}
+
+fn nvml_offset_get(nv: &Nvml, kind: u32) -> Result<(i32, i32, i32), String> {
+    let mut info = NvmlClockOffset::new(kind);
+    let r = unsafe { (nv.get_clock_offsets)(nv.dev, &mut info) };
+    if r != 0 {
+        return Err(format!("NVML: could not read clock offset (error {r})"));
+    }
+    Ok((info.clock_offset_mhz, info.min_offset_mhz, info.max_offset_mhz))
+}
+
+fn nvml_offset_set(nv: &Nvml, kind: u32, offset: i32) -> Result<(), String> {
+    let mut info = NvmlClockOffset::new(kind);
+    info.clock_offset_mhz = offset;
+    let r = unsafe { (nv.set_clock_offsets)(nv.dev, &mut info) };
+    if r != 0 {
+        return Err(format!(
+            "NVML: could not set clock offset (error {r}; driver must be 560+, CoolBits not needed)"
+        ));
+    }
+    Ok(())
+}
+
+/// Persisted GPU OC state (all values None = stock).
+fn gpu_oc_apply(cfg: &mut Cfg) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.gpu_max_clock.is_none() && cfg.gpu_clock_offset.is_none() && cfg.gpu_mem_offset.is_none()
+    {
+        return out;
+    }
+    let nv = match unsafe { nvml_open() } {
+        Ok(n) => n,
+        Err(e) => {
+            out.push(format!("gpu-oc: {e}"));
+            return out;
+        }
+    };
+    if let Some(max) = cfg.gpu_max_clock {
+        let r = unsafe { (nv.set_gpu_locked_clocks)(nv.dev, 0, max) };
+        out.push(if r == 0 {
+            format!("gpu-oc: max GPU clock locked to {max} MHz")
+        } else {
+            format!("gpu-oc: failed to lock max GPU clock (NVML error {r})")
+        });
+    }
+    if let Some(o) = cfg.gpu_clock_offset {
+        out.push(match nvml_offset_set(&nv, NVML_CLOCK_GRAPHICS, o) {
+            Ok(()) => format!("gpu-oc: GPU P0 clock offset +{o} MHz"),
+            Err(e) => e,
+        });
+    }
+    if let Some(o) = cfg.gpu_mem_offset {
+        out.push(match nvml_offset_set(&nv, NVML_CLOCK_MEM, o) {
+            Ok(()) => format!("gpu-oc: VRAM P0 clock offset +{o} MHz"),
+            Err(e) => e,
+        });
+    }
+    out
+}
+
+fn gpu_oc_status() -> Vec<String> {
+    let mut out = Vec::new();
+    let nv = match unsafe { nvml_open() } {
+        Ok(n) => n,
+        Err(e) => {
+            out.push(format!("gpu-oc    : n/a ({e})"));
+            return out;
+        }
+    };
+    let (gcur, gmin, gmax) = nvml_offset_get(&nv, NVML_CLOCK_GRAPHICS)
+        .unwrap_or((0, 0, 0));
+    let (mcur, mmin, mmax) = nvml_offset_get(&nv, NVML_CLOCK_MEM).unwrap_or((0, 0, 0));
+    out.push(format!(
+        "gpu-oc    : P0 core offset {gcur} MHz (range {gmin}..{gmax}), P0 VRAM offset {mcur} MHz (range {mmin}..{mmax})"
+    ));
+    out
+}
+
 fn parse_toggle(s: &str) -> Option<bool> {
     match s.trim() {
         s if s.eq_ignore_ascii_case("on")
@@ -2557,6 +2765,9 @@ struct Cfg {
     kbd_color: Option<Rgb>,
     webcam: Option<bool>,
     touchpad: Option<bool>,
+    gpu_max_clock: Option<u32>,
+    gpu_clock_offset: Option<i32>,
+    gpu_mem_offset: Option<i32>,
     ryzen: RyzenCfg,
     curves: BTreeMap<(Mode, u8), Curve>,
     game_rules: Vec<GameRule>,
@@ -2586,6 +2797,9 @@ impl Cfg {
                 "kbd_color" => c.kbd_color = Rgb::parse(v),
                 "webcam" => c.webcam = parse_toggle(v),
                 "touchpad" => c.touchpad = parse_toggle(v),
+                "gpu_max_clock" => c.gpu_max_clock = v.parse().ok(),
+                "gpu_clock_offset" => c.gpu_clock_offset = v.parse().ok(),
+                "gpu_mem_offset" => c.gpu_mem_offset = v.parse().ok(),
                 "game_mode" => c.game_mode = Mode::parse(v),
                 "game_rule" => {
                     if let Some(r) = GameRule::parse(v) {
@@ -2656,6 +2870,15 @@ impl Cfg {
         }
         if let Some(tp) = self.touchpad {
             let _ = writeln!(s, "touchpad={}", u8::from(tp));
+        }
+        if let Some(v) = self.gpu_max_clock {
+            let _ = writeln!(s, "gpu_max_clock={v}");
+        }
+        if let Some(v) = self.gpu_clock_offset {
+            let _ = writeln!(s, "gpu_clock_offset={v}");
+        }
+        if let Some(v) = self.gpu_mem_offset {
+            let _ = writeln!(s, "gpu_mem_offset={v}");
         }
         for (idx, meta) in RYZEN_FIELDS.iter().enumerate() {
             if let Some(val) = self.ryzen.slot(idx) {
@@ -2817,6 +3040,11 @@ fn apply(cfg: &mut Cfg) -> Vec<String> {
     if cfg.disable_npu {
         note(npu_apply(true, cfg.disable_igpu_dgpu));
     }
+    // After GPU topology changes (mode switch re-enumerates the dGPU and
+    // drops clock settings), before anything else that could reset it again.
+    for l in gpu_oc_apply(cfg) {
+        note(Ok(l));
+    }
     if let Some(m) = cfg.mode {
         note(mode_set(m, cfg));
     } else {
@@ -2950,6 +3178,9 @@ fn status(cfg: &Cfg) {
     );
     println!("cpu stats  :{}", cpu.fmt_line("CPU"));
     println!("gpu stats  :{}", gpu.fmt_line("GPU"));
+    for l in gpu_oc_status() {
+        println!("{l}");
+    }
     println!("fan rpm    : {:?}", fan_rpm());
     for (n, l) in fan_list() {
         if let Some(c) = fan_read(n) {
@@ -3020,6 +3251,11 @@ fn usage() {
          ghl fan default                                      (back to firmware curve)\n\
          ghl kbdbright 0|1|2|3|off|low|med|high\n\
          ghl kbdcolor <RRGGBB | R G B | R,G,B>\n\
+         ghl gpuoc                                            (show GPU clock offsets/caps)\n\
+         ghl gpuoc max <mhz>                                  (cap max GPU clock; 0 = remove)\n\
+         ghl gpuoc offset <±mhz>                              (GPU P-State 0 core offset)\n\
+         ghl gpuoc mem-offset <±mhz>                          (VRAM P-State 0 offset)\n\
+         ghl gpuoc clear                                      (reset all to stock)\n\
          ghl overdrive on|off\n\
          ghl webcam on|off\n\
          ghl touchpad on|off\n\
@@ -3211,6 +3447,92 @@ fn run_cli(a: &[String], cfg: &mut Cfg) -> Result<(), String> {
             cfg.kbd_color = Some(rgb);
             println!("{}", kbd_color_set(rgb)?);
             cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc"] => {
+            for l in gpu_oc_status() {
+                println!("{l}");
+            }
+            println!(
+                "  configured: max_clock={:?} gpu_offset={:?} mem_offset={:?}",
+                cfg.gpu_max_clock, cfg.gpu_clock_offset, cfg.gpu_mem_offset
+            );
+            println!(
+                "  usage: ghl gpuoc max <mhz> | offset <±mhz> | mem-offset <±mhz> | clear"
+            );
+        }
+        ["gpuoc" | "gpu-oc", "max", v] => {
+            let mhz: u32 = v
+                .parse()
+                .map_err(|_| "gpuoc max: give MHz, e.g. ghl gpuoc max 2900 (0 = remove cap)".to_string())?;
+            if mhz == 0 {
+                cfg.gpu_max_clock = None;
+                let nv = unsafe { nvml_open() }?;
+                let r = unsafe { (nv.reset_gpu_locked_clocks)(nv.dev) };
+                println!(
+                    "{}",
+                    if r == 0 {
+                        "gpu-oc: GPU clock lock removed"
+                    } else {
+                        "gpu-oc: failed to unlock GPU clocks"
+                    }
+                );
+            } else {
+                cfg.gpu_max_clock = Some(mhz);
+                let nv = unsafe { nvml_open() }?;
+                let r = unsafe { (nv.set_gpu_locked_clocks)(nv.dev, 0, mhz) };
+                if r != 0 {
+                    return Err(format!(
+                        "gpuoc: NVML rejected max clock {mhz} (error {r})"
+                    ));
+                }
+                println!("gpu-oc: max GPU clock locked to {mhz} MHz (min uncapped)");
+            }
+            cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc", "offset", v] => {
+            let o: i32 = v
+                .trim_start_matches('+')
+                .parse()
+                .map_err(|_| "gpuoc offset: give MHz, e.g. +400 or -200 (0 = none)".to_string())?;
+            cfg.gpu_clock_offset = if o == 0 { None } else { Some(o) };
+            let nv = unsafe { nvml_open() }?;
+            let (_, gmin, gmax) = nvml_offset_get(&nv, NVML_CLOCK_GRAPHICS)?;
+            let clamped = o.clamp(gmin, gmax);
+            if clamped != o {
+                println!("gpu-oc: note: offset clamped to driver range {gmin}..{gmax} MHz");
+            }
+            nvml_offset_set(&nv, NVML_CLOCK_GRAPHICS, clamped)?;
+            println!("gpu-oc: GPU P-State 0 clock offset set to {clamped} MHz");
+            cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc", "mem-offset" | "memoffset" | "mem", v] => {
+            let o: i32 = v
+                .trim_start_matches('+')
+                .parse()
+                .map_err(|_| "gpuoc mem-offset: give MHz, e.g. +2500 or -500 (0 = none)".to_string())?;
+            cfg.gpu_mem_offset = if o == 0 { None } else { Some(o) };
+            let nv = unsafe { nvml_open() }?;
+            let (_, mmin, mmax) = nvml_offset_get(&nv, NVML_CLOCK_MEM)?;
+            let clamped = o.clamp(mmin, mmax);
+            if clamped != o {
+                println!("gpu-oc: note: offset clamped to driver range {mmin}..{mmax} MHz");
+            }
+            nvml_offset_set(&nv, NVML_CLOCK_MEM, clamped)?;
+            println!("gpu-oc: VRAM P-State 0 clock offset set to {clamped} MHz");
+            cfg.save()?;
+        }
+        ["gpuoc" | "gpu-oc", "clear"] => {
+            cfg.gpu_max_clock = None;
+            cfg.gpu_clock_offset = None;
+            cfg.gpu_mem_offset = None;
+            if let Ok(nv) = unsafe { nvml_open() } {
+                let _ = unsafe { (nv.reset_gpu_locked_clocks)(nv.dev) };
+                let _ = unsafe { (nv.reset_mem_locked_clocks)(nv.dev) };
+                let _ = nvml_offset_set(&nv, NVML_CLOCK_GRAPHICS, 0);
+                let _ = nvml_offset_set(&nv, NVML_CLOCK_MEM, 0);
+            }
+            cfg.save()?;
+            println!("gpu-oc: all GPU clock settings cleared and reset to stock");
         }
         ["kbdcolor", r, g, b] => {
             let rgb = Rgb::parse(&format!("{r},{g},{b}"))
@@ -4521,7 +4843,9 @@ fn main() {
     || (matches!(
             args.first().map(String::as_str),
             Some("gamemode" | "game-mode")
-        ) && matches!(args.get(1).map(String::as_str), Some("status" | "list" | "running")));
+        ) && matches!(args.get(1).map(String::as_str), Some("status" | "list" | "running")))
+    || (matches!(args.first().map(String::as_str), Some("gpuoc" | "gpu-oc"))
+        && (args.len() == 1 || matches!(args.get(1).map(String::as_str), None | Some(""))));
     let euid = fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(1);
     if euid != 0 && !read_only {
         let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("ghl"));
